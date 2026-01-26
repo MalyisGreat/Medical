@@ -52,30 +52,78 @@ frequent urination (polyuria), unexplained weight loss...
 pip install -r requirements.txt
 
 # Test data loading
-python train.py --test_only
+python train.py --test_only --datasets synth
 
 # Train tiny model (testing)
-python train.py --model tiny --max_tokens 100000 --max_steps 100
+python train.py --model tiny --max_tokens 100000 --max_steps 100 --datasets wikitext
 ```
 
 ### Full training (8xH100)
-```bash
-# Edit train.py line 161 to use medical datasets:
-# datasets=["synth", "guidelines", "openmedtext"]
 
-python train.py \
+**Option 1: STREAMING (fastest start, recommended)**
+```bash
+# No prep step - starts training immediately!
+torchrun --nproc_per_node=8 train.py \
     --model medium \
-    --max_tokens 5000000000 \
-    --batch_size 32 \
-    --max_steps 50000
+    --streaming \
+    --datasets synth,guidelines,openmedtext \
+    --batch_size 64 \
+    --max_steps 40000 \
+    --compile
+
+# Resume from checkpoint
+torchrun --nproc_per_node=8 train.py \
+    --model medium \
+    --streaming \
+    --datasets synth,guidelines,openmedtext \
+    --resume output/checkpoint_10000.pt
 ```
+
+**Option 2: Pre-prepared shards (if network is slow)**
+```bash
+# Step 1: Prepare data once
+python prepare_data.py \
+    --max_tokens 5000000000 \
+    --datasets synth,guidelines,openmedtext \
+    --output ./data_shards
+
+# Step 2: Train from shards
+torchrun --nproc_per_node=8 train.py \
+    --model medium \
+    --data_dir ./data_shards \
+    --batch_size 64 \
+    --max_steps 40000 \
+    --compile
+```
+
+### Local testing
+```bash
+# Quick streaming test
+python train.py --model tiny --streaming --datasets synth --max_steps 100
+
+# Or with cached data
+python train.py --model tiny --max_tokens 1000000 --datasets wikitext
+```
+
+### Available datasets
+- `wikitext` - WikiText-2 (for testing)
+- `synth` - SYNTH reasoning chains (40% weight)
+- `pubmed` - PubMed abstracts (30% weight)
+- `guidelines` - Clinical guidelines (15% weight)
+- `openmedtext` - Medical textbooks (10% weight)
+- `fineweb_edu` - General education (5% weight)
 
 ## Cost Estimates
 
-| Model | Tokens | Time (8xH100) | Cost |
-|-------|--------|---------------|------|
+With `--compile` and streaming on 8xH100 (~$12/hr on Lambda/Vast):
+
+| Model | Tokens | Time | Cost |
+|-------|--------|------|------|
+| medium (406M) | 2B | ~45 min | ~$9 |
 | medium (406M) | 5B | ~2 hours | ~$24 |
-| baguette (308M) | 5B | ~3 hours | ~$36 |
+| baguette (308M) | 5B | ~2.5 hours | ~$30 |
+
+**Note:** SYNTH data is high-quality reasoning chains - you may get good results with fewer tokens than traditional pretraining.
 
 ## Evaluation
 

@@ -18,6 +18,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    TrainerCallback,
 )
 from peft import (
     LoraConfig,
@@ -214,6 +215,72 @@ def is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
 
+class PeriodicBenchmarkCallback(TrainerCallback):
+    def __init__(
+        self,
+        eval_every_percent: float,
+        output_dir: str,
+        benchmarks: List[str],
+        num_questions: int,
+        system_prompt: str,
+    ):
+        self.eval_every_percent = eval_every_percent
+        self.output_dir = output_dir
+        self.benchmarks = benchmarks
+        self.num_questions = num_questions
+        self.system_prompt = system_prompt
+        self.next_percent = eval_every_percent
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.eval_every_percent <= 0:
+            return control
+        if state.max_steps is None or state.max_steps <= 0:
+            return control
+
+        progress = 100.0 * state.global_step / state.max_steps
+        if progress + 1e-6 < self.next_percent:
+            return control
+
+        model = kwargs.get("model")
+        tokenizer = kwargs.get("tokenizer")
+
+        if model is None or tokenizer is None:
+            return control
+
+        # Ensure all ranks pause while rank 0 evaluates
+        if is_main_process():
+            was_training = model.training
+            model.eval()
+            device = next(model.parameters()).device
+            results = evaluate_model(
+                model=model,
+                tokenizer=tokenizer,
+                device=str(device),
+                benchmarks=self.benchmarks,
+                num_questions=self.num_questions,
+                system_prompt=self.system_prompt,
+            )
+            os.makedirs(self.output_dir, exist_ok=True)
+            out_path = os.path.join(self.output_dir, "benchmark_progress.jsonl")
+            payload = {
+                "global_step": state.global_step,
+                "progress_percent": round(progress, 2),
+                "results": results,
+            }
+            with open(out_path, "a") as f:
+                f.write(json.dumps(payload) + "\n")
+            if was_training:
+                model.train()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        self.next_percent += self.eval_every_percent
+        return control
+
+
 def train(
     model_name: str,
     output_dir: str,
@@ -237,6 +304,7 @@ def train(
     max_params_b: float,
     prefer_family: str,
     tf32: bool,
+    eval_interval_percent: float,
 ):
     if model_name == "auto":
         model_name = select_best_model(max_params_b=max_params_b, prefer_family=prefer_family)
@@ -266,7 +334,9 @@ def train(
         torch.backends.cudnn.allow_tf32 = True
 
     loader = MedicalDatasetLoader(system_prompt=system_prompt)
-    samples_per_dataset = max_samples // len(datasets)
+    samples_per_dataset = None
+    if max_samples and max_samples > 0:
+        samples_per_dataset = max_samples // len(datasets)
     train_dataset = loader.load_combined(
         datasets=datasets,
         split="train",
@@ -325,6 +395,9 @@ def train(
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "benchmark_before.json"), "w") as f:
             json.dump(results_before, f, indent=2)
+        for name, res in results_before.items():
+            acc = res["accuracy"] * 100
+            print(f"{name:10s}: {acc:5.1f}% ({res['correct']}/{res['total']})")
 
     print("\n" + "-" * 60)
     print("Starting Training")
@@ -337,6 +410,16 @@ def train(
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
+    if eval_interval_percent and eval_interval_percent > 0:
+        trainer.add_callback(
+            PeriodicBenchmarkCallback(
+                eval_every_percent=eval_interval_percent,
+                output_dir=output_dir,
+                benchmarks=eval_benchmarks,
+                num_questions=eval_questions,
+                system_prompt=system_prompt,
+            )
+        )
 
     trainer.train()
 
@@ -363,6 +446,9 @@ def train(
         )
         with open(os.path.join(output_dir, "benchmark_after.json"), "w") as f:
             json.dump(results_after, f, indent=2)
+        for name, res in results_after.items():
+            acc = res["accuracy"] * 100
+            print(f"{name:10s}: {acc:5.1f}% ({res['correct']}/{res['total']})")
 
     print("\nTraining Complete!")
     return trainer
@@ -397,7 +483,7 @@ def main():
     parser.add_argument("--output", "-o", default="./medical_llm_output",
                         help="Output directory for checkpoints")
     parser.add_argument("--max_samples", "-n", type=int, default=20000,
-                        help="Maximum training samples")
+                        help="Maximum training samples (0 = uncapped)")
     parser.add_argument("--epochs", "-e", type=int, default=3,
                         help="Number of training epochs")
     parser.add_argument("--batch_size", "-b", type=int, default=8,
@@ -424,6 +510,8 @@ def main():
                         help="Run holdout benchmark after training")
     parser.add_argument("--eval_questions", type=int, default=100,
                         help="Questions per benchmark")
+    parser.add_argument("--eval_interval_percent", type=float, default=0,
+                        help="Run holdout benchmark every N%% of training (0 = off)")
     parser.add_argument("--eval_benchmarks", type=str, default="medqa,medmcqa,pubmedqa",
                         help="Comma-separated benchmarks")
     parser.add_argument("--system_prompt", type=str, default="You are a medical expert.",
@@ -460,6 +548,7 @@ def main():
         max_params_b=args.max_params_b,
         prefer_family=args.prefer_family,
         tf32=args.tf32,
+        eval_interval_percent=args.eval_interval_percent,
     )
 
 

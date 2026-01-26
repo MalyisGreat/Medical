@@ -54,6 +54,33 @@ python train.py \
   --eval_before --eval_after
 ```
 
+## Uncapped data + periodic benchmarks
+
+Run on full available data (no cap) and evaluate every 10% of training:
+
+```bash
+python train.py \
+  --model Qwen/Qwen3-0.6B \
+  --datasets pubmedqa medqa medmcqa \
+  --max_samples 0 \
+  --eval_before --eval_after \
+  --eval_interval_percent 10
+```
+
+Periodic results are appended to:
+- `medical_llm_output/benchmark_progress.jsonl`
+
+## Multi-GPU (DDP)
+
+```bash
+torchrun --nproc_per_node=8 train.py \
+  --model Qwen/Qwen3-0.6B \
+  --datasets pubmedqa medqa medmcqa \
+  --max_samples 0 \
+  --eval_before --eval_after \
+  --eval_interval_percent 10
+```
+
 ## Standalone Benchmark
 
 ```bash

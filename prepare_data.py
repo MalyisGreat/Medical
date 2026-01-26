@@ -4,18 +4,14 @@ Data Preparation Script for Large-Scale Training
 Downloads and tokenizes data into sharded binary files for efficient training.
 Run this BEFORE training on H100s to avoid download bottlenecks.
 
-PARALLEL DOWNLOADS: Uses multiprocessing to download datasets simultaneously.
-SPLIT LARGE DATASETS: Can split a single large dataset (like SYNTH) across multiple workers.
+FAST DOWNLOAD: Uses snapshot_download with parallel workers (much faster than streaming!)
 
 Usage:
-    # Prepare 5B tokens (for full training)
-    python prepare_data.py --max_tokens 5000000000 --datasets synth,guidelines,openmedtext
+    # Prepare 2B tokens (FAST - uses parallel download)
+    python prepare_data.py --max_tokens 2000000000 --datasets synth,guidelines
 
     # Prepare 100M tokens (for testing)
     python prepare_data.py --max_tokens 100000000 --datasets synth
-
-    # FAST: Split SYNTH across 4 parallel workers
-    python prepare_data.py --max_tokens 2000000000 --datasets synth,guidelines --split_workers 4
 """
 
 import os
@@ -23,89 +19,150 @@ import time
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Iterator, Dict, Any
 import random
-from multiprocessing import Pool, cpu_count
-import tempfile
 
-from data_loader import MedicalPretrainDataLoader, MEDICAL_DATASETS
+import tiktoken
+from huggingface_hub import snapshot_download
+from datasets import load_dataset
+
+# Dataset configurations
+DATASET_CONFIGS = {
+    "synth": {
+        "repo_id": "PleIAs/SYNTH",
+        "weight": 0.40,
+    },
+    "guidelines": {
+        "repo_id": "epfl-llm/guidelines",
+        "weight": 0.15,
+    },
+    "openmedtext": {
+        "repo_id": "ywchoi/OpenMedText",
+        "weight": 0.10,
+    },
+    "wikitext": {
+        "repo_id": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "weight": 1.0,
+    },
+}
 
 
-def download_dataset_chunk(args: Tuple[str, int, int, str, int, int]) -> Tuple[str, str, int]:
+def format_synth(example: Dict[str, Any]) -> str:
+    """Format SYNTH with reasoning chain (English only)."""
+    lang = example.get("language", "")
+    if lang != "en":
+        return ""
+
+    query = example.get("query", "")
+    reasoning = example.get("synthetic_reasoning", "")
+    answer = example.get("synthetic_answer", "")
+
+    if reasoning and answer:
+        return f"<|question|>\n{query}\n<|thinking|>\n{reasoning}\n<|answer|>\n{answer}"
+    elif reasoning:
+        return f"<|question|>\n{query}\n<|thinking|>\n{reasoning}"
+    return query
+
+
+def format_guidelines(example: Dict[str, Any]) -> str:
+    """Format clinical guidelines."""
+    title = example.get("title", "")
+    text = example.get("clean_text", example.get("text", ""))
+    if title and text:
+        return f"Clinical Guideline: {title}\n\n{text}"
+    return text
+
+
+def format_example(example: Dict[str, Any], dataset_name: str) -> str:
+    """Format example based on dataset type."""
+    if dataset_name == "synth":
+        return format_synth(example)
+    elif dataset_name == "guidelines":
+        return format_guidelines(example)
+    else:
+        return example.get("text", "")
+
+
+def fast_download_dataset(
+    dataset_name: str,
+    target_tokens: int,
+    seq_length: int,
+    tokenizer,
+    download_workers: int = 8,
+) -> List[int]:
     """
-    Download and tokenize a chunk of a dataset (runs in parallel).
-
-    Args:
-        args: (dataset_name, target_tokens, seq_length, temp_dir, worker_id, skip_samples)
-
-    Returns:
-        (worker_name, temp_file_path, token_count)
+    Download dataset FAST using snapshot_download with parallel workers.
+    Then load and tokenize locally.
     """
-    dataset_name, target_tokens, seq_length, temp_dir, worker_id, skip_samples = args
+    config = DATASET_CONFIGS[dataset_name]
+    repo_id = config["repo_id"]
 
-    worker_name = f"{dataset_name}_{worker_id}" if worker_id > 0 else dataset_name
-
-    print(f"\n[{worker_name}] Starting download (skip {skip_samples:,} samples)...")
-
-    # Initialize loader for this process
-    loader = MedicalPretrainDataLoader(
-        datasets=[dataset_name],
-        max_seq_length=seq_length,
-        seed=42 + worker_id,  # Different seed per worker
-    )
-
-    target_samples = (target_tokens // seq_length) * 2
-
-    dataset_tokens = []
-    token_count = 0
-    sample_count = 0
-    skipped = 0
+    print(f"\n[{dataset_name}] Downloading with {download_workers} parallel workers...")
     start_time = time.time()
-    last_print = start_time
+
+    # Step 1: Fast parallel download of all files
+    try:
+        cache_dir = snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            max_workers=download_workers,  # Parallel file downloads!
+        )
+        download_time = time.time() - start_time
+        print(f"[{dataset_name}] Download complete in {download_time:.1f}s")
+    except Exception as e:
+        print(f"[{dataset_name}] snapshot_download failed: {e}")
+        print(f"[{dataset_name}] Falling back to streaming...")
+        cache_dir = None
+
+    # Step 2: Load from cache and tokenize
+    print(f"[{dataset_name}] Loading and tokenizing...")
+    start_time = time.time()
 
     try:
-        for text in loader.load_dataset_samples(dataset_name, max_samples=skip_samples + target_samples):
-            # Skip samples assigned to other workers
-            if skipped < skip_samples:
-                skipped += 1
-                continue
-
-            tokens = loader.tokenize_text(text)
-            eos = loader.tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
-            tokens.append(eos)
-
-            dataset_tokens.extend(tokens)
-            token_count += len(tokens)
-            sample_count += 1
-
-            if token_count >= target_tokens:
-                break
-
-            # Progress update every 5 seconds
-            now = time.time()
-            if now - last_print > 5:
-                elapsed = now - start_time
-                tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-                progress_pct = (token_count / target_tokens) * 100
-                eta_min = ((target_tokens - token_count) / tokens_per_sec / 60) if tokens_per_sec > 0 else 0
-                print(f"[{worker_name}] {progress_pct:5.1f}% | {token_count/1e6:.1f}M tokens | {tokens_per_sec/1e6:.2f}M tok/s | ETA: {eta_min:.1f}min")
-                last_print = now
-
-        elapsed = time.time() - start_time
-        tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-        print(f"[{worker_name}] DONE: {token_count/1e6:.1f}M tokens in {elapsed:.1f}s ({tokens_per_sec/1e6:.2f}M tok/s)")
-
-        # Save to temp file
-        temp_file = os.path.join(temp_dir, f"{worker_name}_tokens.npy")
-        np.array(dataset_tokens[:target_tokens], dtype=np.uint32).tofile(temp_file)
-
-        return worker_name, temp_file, min(token_count, target_tokens)
-
+        if cache_dir:
+            # Load from downloaded cache (fast!)
+            ds = load_dataset(repo_id, config.get("name"), split="train")
+        else:
+            # Fallback to streaming
+            ds = load_dataset(repo_id, config.get("name"), split="train", streaming=True)
     except Exception as e:
-        print(f"[{worker_name}] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return worker_name, None, 0
+        print(f"[{dataset_name}] Error loading: {e}")
+        return []
+
+    tokens = []
+    eos = tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
+    target_samples = (target_tokens // seq_length) * 2
+
+    sample_count = 0
+    last_print = time.time()
+
+    for example in ds:
+        text = format_example(example, dataset_name)
+        if len(text) < 50:
+            continue
+
+        example_tokens = tokenizer.encode(text, disallowed_special=())
+        example_tokens.append(eos)
+        tokens.extend(example_tokens)
+        sample_count += 1
+
+        if len(tokens) >= target_tokens:
+            break
+
+        # Progress every 5 seconds
+        now = time.time()
+        if now - last_print > 5:
+            progress = len(tokens) / target_tokens * 100
+            tok_per_sec = len(tokens) / (now - start_time)
+            eta = (target_tokens - len(tokens)) / tok_per_sec / 60 if tok_per_sec > 0 else 0
+            print(f"[{dataset_name}] {progress:.1f}% | {len(tokens)/1e6:.1f}M tokens | {tok_per_sec/1e6:.2f}M tok/s | ETA: {eta:.1f}min")
+            last_print = now
+
+    elapsed = time.time() - start_time
+    print(f"[{dataset_name}] DONE: {len(tokens)/1e6:.1f}M tokens in {elapsed:.1f}s ({len(tokens)/elapsed/1e6:.2f}M tok/s)")
+
+    return tokens[:target_tokens]
 
 
 def prepare_sharded_data(
@@ -115,14 +172,10 @@ def prepare_sharded_data(
     shard_size: int = 100_000_000,
     seq_length: int = 512,
     seed: int = 42,
-    num_workers: int = None,
-    split_workers: int = 1,  # How many workers to split large datasets across
+    download_workers: int = 8,
 ):
     """
-    Prepare training data as sharded binary files with PARALLEL downloads.
-
-    Args:
-        split_workers: Split large datasets (like SYNTH) across this many workers for faster download.
+    Prepare training data as sharded binary files with FAST parallel downloads.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -130,21 +183,24 @@ def prepare_sharded_data(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Initialize tokenizer
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+
     print("=" * 60)
-    print("Preparing Training Data (PARALLEL MODE)")
+    print("Preparing Training Data (FAST PARALLEL DOWNLOAD)")
     print("=" * 60)
     print(f"Datasets: {datasets}")
     print(f"Target tokens: {max_tokens:,}")
-    print(f"Split workers per dataset: {split_workers}")
+    print(f"Download workers: {download_workers}")
     print(f"Shard size: {shard_size:,} tokens")
     print(f"Sequence length: {seq_length}")
     print(f"Output: {output_dir}")
 
     # Calculate tokens per dataset based on weights
-    total_weight = sum(MEDICAL_DATASETS[d].weight for d in datasets)
+    total_weight = sum(DATASET_CONFIGS[d]["weight"] for d in datasets)
     dataset_targets = {}
     for d in datasets:
-        weight_ratio = MEDICAL_DATASETS[d].weight / total_weight
+        weight_ratio = DATASET_CONFIGS[d]["weight"] / total_weight
         dataset_targets[d] = int(max_tokens * weight_ratio)
 
     print(f"\nDataset allocation:")
@@ -152,69 +208,27 @@ def prepare_sharded_data(
         print(f"  {d}: {tokens:,} tokens ({tokens/max_tokens*100:.1f}%)")
 
     print(f"\n" + "-" * 60)
-    print("Downloading datasets in PARALLEL...")
+    print("Downloading and tokenizing...")
     print("-" * 60)
 
     start_time = time.time()
+    all_tokens = []
 
-    # Create temp directory for intermediate files
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Prepare args for parallel download
-        # Split large datasets across multiple workers
-        download_args = []
+    # Download each dataset with fast parallel download
+    for name in datasets:
+        target = dataset_targets[name]
+        tokens = fast_download_dataset(
+            name, target, seq_length, tokenizer, download_workers
+        )
+        all_tokens.extend(tokens)
+        print(f"  {name}: {len(tokens):,} tokens collected")
 
-        for name in datasets:
-            target = dataset_targets[name]
+    download_time = time.time() - start_time
+    print(f"\n" + "-" * 60)
+    print(f"All downloads complete in {download_time:.1f}s ({download_time/60:.1f}min)")
+    print("-" * 60)
 
-            # Only split large datasets (SYNTH) and if split_workers > 1
-            if split_workers > 1 and name == "synth" and target > 100_000_000:
-                # Split SYNTH across multiple workers
-                tokens_per_worker = target // split_workers
-                samples_per_worker = tokens_per_worker // seq_length * 2
-
-                print(f"\n  Splitting {name} across {split_workers} workers ({tokens_per_worker/1e6:.0f}M tokens each)")
-
-                for i in range(split_workers):
-                    skip = i * samples_per_worker
-                    worker_tokens = tokens_per_worker if i < split_workers - 1 else target - (tokens_per_worker * i)
-                    download_args.append((name, worker_tokens, seq_length, temp_dir, i, skip))
-            else:
-                # Single worker for this dataset
-                download_args.append((name, target, seq_length, temp_dir, 0, 0))
-
-        total_workers = len(download_args)
-        if num_workers is None:
-            num_workers = min(total_workers, cpu_count())
-
-        print(f"\nTotal parallel downloads: {total_workers}")
-        print(f"Worker pool size: {num_workers}")
-
-        # Download in parallel
-        if num_workers > 1 and total_workers > 1:
-            with Pool(num_workers) as pool:
-                results = pool.map(download_dataset_chunk, download_args)
-        else:
-            # Sequential for single dataset
-            results = [download_dataset_chunk(args) for args in download_args]
-
-        download_time = time.time() - start_time
-        print(f"\n" + "-" * 60)
-        print(f"Downloads complete in {download_time:.1f}s")
-        print("-" * 60)
-
-        # Merge results
-        print("\nMerging tokens...")
-        all_tokens = []
-        total_collected = 0
-
-        for name, temp_file, count in results:
-            if temp_file and os.path.exists(temp_file):
-                tokens = np.fromfile(temp_file, dtype=np.uint32)
-                all_tokens.extend(tokens.tolist())
-                total_collected += count
-                print(f"  {name}: {count:,} tokens")
-
-    print(f"\nTotal tokens collected: {total_collected:,}")
+    print(f"\nTotal tokens collected: {len(all_tokens):,}")
 
     # Create chunks
     print(f"\nCreating chunks and shuffling...")
@@ -259,7 +273,7 @@ def prepare_sharded_data(
     import json
     metadata = {
         "datasets": datasets,
-        "total_tokens": total_collected,
+        "total_tokens": len(all_tokens),
         "total_chunks": len(chunks),
         "seq_length": seq_length,
         "num_shards": num_shards,
@@ -287,9 +301,9 @@ def prepare_sharded_data(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare training data (parallel downloads)")
+    parser = argparse.ArgumentParser(description="Prepare training data (fast parallel downloads)")
 
-    parser.add_argument("--datasets", type=str, default="synth,guidelines,openmedtext",
+    parser.add_argument("--datasets", type=str, default="synth,guidelines",
                         help="Comma-separated dataset names")
     parser.add_argument("--max_tokens", type=int, default=100_000_000,
                         help="Total tokens to prepare")
@@ -301,10 +315,8 @@ def main():
                         help="Sequence length")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
-    parser.add_argument("--workers", type=int, default=None,
-                        help="Number of parallel workers (default: auto)")
-    parser.add_argument("--split_workers", type=int, default=1,
-                        help="Split large datasets (SYNTH) across N workers (default: 1, try 4 for faster)")
+    parser.add_argument("--download_workers", type=int, default=8,
+                        help="Number of parallel download workers (default: 8)")
 
     args = parser.parse_args()
 
@@ -317,8 +329,7 @@ def main():
         shard_size=args.shard_size,
         seq_length=args.seq_length,
         seed=args.seed,
-        num_workers=args.workers,
-        split_workers=args.split_workers,
+        download_workers=args.download_workers,
     )
 
 

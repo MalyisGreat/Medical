@@ -81,6 +81,15 @@ torchrun --nproc_per_node=8 train.py \
   --eval_interval_percent 10
 ```
 
+## Strict holdout (default)
+
+Benchmarks use held-out splits only. PubMedQA will **not** fall back to train
+unless you explicitly allow it:
+
+```bash
+python benchmark.py --model Qwen/Qwen3-0.6B --allow_train_fallback
+```
+
 ## Standalone Benchmark
 
 ```bash

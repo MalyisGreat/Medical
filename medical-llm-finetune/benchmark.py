@@ -122,13 +122,15 @@ def load_medmcqa(num_questions: Optional[int] = 100) -> List[Dict]:
     return questions
 
 
-def load_pubmedqa(num_questions: Optional[int] = 100) -> List[Dict]:
+def load_pubmedqa(num_questions: Optional[int] = 100, strict_holdout: bool = True) -> List[Dict]:
     try:
         ds = load_dataset("bigbio/pubmed_qa", "pubmed_qa_labeled_fold0_source", split="test")
     except Exception:
         try:
             ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="test")
         except Exception:
+            if strict_holdout:
+                raise RuntimeError("PubMedQA test split not available; strict holdout is enabled.")
             ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
 
     questions = []
@@ -157,6 +159,7 @@ def evaluate_model(
     benchmarks: List[str],
     num_questions: Optional[int],
     system_prompt: str,
+    strict_holdout: bool = True,
 ) -> Dict[str, Dict]:
     model.eval()
     results = {}
@@ -168,7 +171,7 @@ def evaluate_model(
             qs = load_medmcqa(num_questions)
             results[name] = _evaluate_mcq(model, tokenizer, device, system_prompt, qs)
         elif name == "pubmedqa":
-            qs = load_pubmedqa(num_questions)
+            qs = load_pubmedqa(num_questions, strict_holdout=strict_holdout)
             results[name] = _evaluate_yes_no(model, tokenizer, device, system_prompt, qs)
     return results
 
@@ -182,6 +185,8 @@ def main():
                         help="Comma-separated benchmark names")
     parser.add_argument("--system_prompt", type=str, default="You are a medical expert.",
                         help="System prompt used for evaluation")
+    parser.add_argument("--allow_train_fallback", action="store_true",
+                        help="Allow PubMedQA benchmark to fall back to train split (not strict holdout)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use")
     args = parser.parse_args()
@@ -196,7 +201,16 @@ def main():
 
     benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
     num_questions = None if args.num_questions <= 0 else args.num_questions
-    results = evaluate_model(model, tokenizer, device, benchmarks, num_questions, args.system_prompt)
+    strict_holdout = not args.allow_train_fallback
+    results = evaluate_model(
+        model,
+        tokenizer,
+        device,
+        benchmarks,
+        num_questions,
+        args.system_prompt,
+        strict_holdout=strict_holdout,
+    )
 
     for name, res in results.items():
         acc = res["accuracy"] * 100

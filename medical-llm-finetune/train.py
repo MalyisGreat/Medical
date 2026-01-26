@@ -223,12 +223,14 @@ class PeriodicBenchmarkCallback(TrainerCallback):
         benchmarks: List[str],
         num_questions: int,
         system_prompt: str,
+        allow_train_fallback: bool,
     ):
         self.eval_every_percent = eval_every_percent
         self.output_dir = output_dir
         self.benchmarks = benchmarks
         self.num_questions = num_questions
         self.system_prompt = system_prompt
+        self.strict_holdout = not allow_train_fallback
         self.next_percent = eval_every_percent
 
     def on_step_end(self, args, state, control, **kwargs):
@@ -259,6 +261,7 @@ class PeriodicBenchmarkCallback(TrainerCallback):
                 benchmarks=self.benchmarks,
                 num_questions=self.num_questions,
                 system_prompt=self.system_prompt,
+                strict_holdout=self.strict_holdout,
             )
             os.makedirs(self.output_dir, exist_ok=True)
             out_path = os.path.join(self.output_dir, "benchmark_progress.jsonl")
@@ -305,6 +308,7 @@ def train(
     prefer_family: str,
     tf32: bool,
     eval_interval_percent: float,
+    allow_train_fallback: bool,
 ):
     if model_name == "auto":
         model_name = select_best_model(max_params_b=max_params_b, prefer_family=prefer_family)
@@ -391,6 +395,7 @@ def train(
             benchmarks=eval_benchmarks,
             num_questions=eval_questions,
             system_prompt=system_prompt,
+            strict_holdout=not allow_train_fallback,
         )
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "benchmark_before.json"), "w") as f:
@@ -418,6 +423,7 @@ def train(
                 benchmarks=eval_benchmarks,
                 num_questions=eval_questions,
                 system_prompt=system_prompt,
+                allow_train_fallback=allow_train_fallback,
             )
         )
 
@@ -443,6 +449,7 @@ def train(
             benchmarks=eval_benchmarks,
             num_questions=eval_questions,
             system_prompt=system_prompt,
+            strict_holdout=not allow_train_fallback,
         )
         with open(os.path.join(output_dir, "benchmark_after.json"), "w") as f:
             json.dump(results_after, f, indent=2)
@@ -516,6 +523,8 @@ def main():
                         help="Comma-separated benchmarks")
     parser.add_argument("--system_prompt", type=str, default="You are a medical expert.",
                         help="System prompt for chat formatting")
+    parser.add_argument("--allow_train_fallback", action="store_true",
+                        help="Allow PubMedQA benchmark to fall back to train split (not strict holdout)")
     parser.add_argument("--tf32", action="store_true",
                         help="Enable TF32 matmul (recommended on H100)")
 
@@ -549,6 +558,7 @@ def main():
         prefer_family=args.prefer_family,
         tf32=args.tf32,
         eval_interval_percent=args.eval_interval_percent,
+        allow_train_fallback=args.allow_train_fallback,
     )
 
 

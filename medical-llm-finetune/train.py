@@ -158,6 +158,11 @@ def load_model_and_tokenizer(
     if hasattr(model, "config"):
         model.config.use_cache = False
 
+    # Report attention implementation for debugging
+    attn_impl_actual = getattr(model.config, "attn_implementation", None)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    print(f"[rank {local_rank}] attn_impl={attn_impl_actual}")
+
     if use_qlora:
         model = prepare_model_for_kbit_training(model)
 

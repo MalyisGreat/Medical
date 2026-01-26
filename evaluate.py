@@ -261,8 +261,12 @@ def load_pubmedqa(num_questions: int = 10) -> List[Dict]:
 
         # PubMedQA: context, question, answer (yes/no/maybe)
         context = item.get("context", item.get("CONTEXTS", ""))
+        if isinstance(context, dict):
+            # Some formats have context as dict with 'contexts' key
+            context = context.get("contexts", str(context))
         if isinstance(context, list):
-            context = " ".join(context)
+            context = " ".join(str(c) for c in context)
+        context = str(context) if context else ""
 
         question = item.get("question", item.get("QUESTION", ""))
         answer = item.get("answer", item.get("final_decision", item.get("LONG_ANSWER", "")))
@@ -274,7 +278,8 @@ def load_pubmedqa(num_questions: int = 10) -> List[Dict]:
         else:
             correct_idx = 0
 
-        full_question = f"Context: {context[:500]}...\n\nQuestion: {question}"
+        context_preview = context[:500] if len(context) > 500 else context
+        full_question = f"Context: {context_preview}...\n\nQuestion: {question}"
 
         questions.append({
             "question": full_question,
@@ -373,8 +378,13 @@ def main():
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
 
-    # Handle DDP checkpoint (state_dict keys may have 'module.' prefix)
-    state_dict = checkpoint.get("model", checkpoint)
+    # Handle different checkpoint formats
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint  # Assume it's just the state dict
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 

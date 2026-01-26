@@ -277,8 +277,8 @@ class MedicalPretrainDataLoader:
             return
 
     def tokenize_text(self, text: str) -> List[int]:
-        """Tokenize text using tiktoken."""
-        return self.tokenizer.encode(text, allowed_special=set())
+        """Tokenize text using tiktoken (allows special tokens from SYNTH dataset)."""
+        return self.tokenizer.encode(text, disallowed_special=())
 
     def create_training_chunks(
         self,

@@ -380,7 +380,7 @@ class MedicalPretrainDataLoader:
         """Save tokenized data as binary file for fast loading."""
         import numpy as np
 
-        data = np.array(chunks, dtype=np.uint16)
+        data = np.array(chunks, dtype=np.uint32)
         data.tofile(output_path)
 
         print(f"Saved {len(chunks)} chunks to {output_path}")

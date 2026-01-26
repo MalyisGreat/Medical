@@ -22,6 +22,47 @@ import tiktoken
 from datasets import load_dataset
 
 
+# Dataset configurations for streaming mode
+STREAMING_DATASETS = {
+    "synth": {
+        "path": "PleIAs/SYNTH",
+        "name": None,
+        "split": "train",
+        "weight": 0.40,
+    },
+    "pubmed": {
+        "path": "ncbi/pubmed",
+        "name": None,
+        "split": "train",
+        "weight": 0.30,
+    },
+    "guidelines": {
+        "path": "epfl-llm/guidelines",
+        "name": None,
+        "split": "train",
+        "weight": 0.15,
+    },
+    "openmedtext": {
+        "path": "ywchoi/OpenMedText",
+        "name": None,
+        "split": "train",
+        "weight": 0.10,
+    },
+    "fineweb_edu": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "split": "train",
+        "weight": 0.05,
+    },
+    "wikitext": {
+        "path": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "train",
+        "weight": 1.0,
+    },
+}
+
+
 class StreamingMedicalDataset(IterableDataset):
     """
     Streams and tokenizes medical data on-the-fly.
@@ -48,38 +89,7 @@ class StreamingMedicalDataset(IterableDataset):
         self.eos_token = self.tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
 
         # Dataset configs
-        self.dataset_configs = {
-            "synth": {
-                "path": "PleIAs/SYNTH",
-                "name": None,
-                "split": "train",
-                "weight": 0.40,
-            },
-            "guidelines": {
-                "path": "epfl-llm/guidelines",
-                "name": None,
-                "split": "train",
-                "weight": 0.15,
-            },
-            "openmedtext": {
-                "path": "ywchoi/OpenMedText",
-                "name": None,
-                "split": "train",
-                "weight": 0.10,
-            },
-            "fineweb_edu": {
-                "path": "HuggingFaceFW/fineweb-edu",
-                "name": "sample-10BT",
-                "split": "train",
-                "weight": 0.05,
-            },
-            "wikitext": {
-                "path": "wikitext",
-                "name": "wikitext-103-raw-v1",  # Larger version
-                "split": "train",
-                "weight": 1.0,
-            },
-        }
+        self.dataset_configs = STREAMING_DATASETS
 
     def _format_synth(self, example) -> str:
         """Format SYNTH with reasoning chain."""
@@ -105,10 +115,30 @@ class StreamingMedicalDataset(IterableDataset):
             return f"Clinical Guideline: {title}\n\n{text}"
         return text
 
+    def _format_pubmed(self, example) -> str:
+        """Format PubMed abstract with title."""
+        try:
+            citation = example.get("MedlineCitation", {})
+            article = citation.get("Article", {})
+            title = article.get("ArticleTitle", "")
+            abstract = article.get("Abstract", {})
+            abstract_text = abstract.get("AbstractText", "")
+
+            if isinstance(abstract_text, list):
+                abstract_text = " ".join(str(t) for t in abstract_text if t)
+
+            if title and abstract_text:
+                return f"Title: {title}\n\nAbstract: {abstract_text}"
+            return abstract_text or title or ""
+        except Exception:
+            return ""
+
     def _format_example(self, example, dataset_name: str) -> str:
         """Format example based on dataset type."""
         if dataset_name == "synth":
             return self._format_synth(example)
+        elif dataset_name == "pubmed":
+            return self._format_pubmed(example)
         elif dataset_name == "guidelines":
             return self._format_guidelines(example)
         else:
@@ -135,7 +165,7 @@ class StreamingMedicalDataset(IterableDataset):
             print(f"Error streaming {dataset_name}: {e}")
             return
 
-    def _interleave_datasets(self) -> Iterator[str]:
+    def _interleave_datasets(self, rng_seed: int) -> Iterator[str]:
         """Interleave multiple datasets based on weights."""
         # Create iterators for each dataset
         iterators = {}
@@ -154,7 +184,7 @@ class StreamingMedicalDataset(IterableDataset):
         probs = {k: v / total_weight for k, v in weights.items()}
 
         # Weighted random sampling
-        rng = random.Random(self.seed)
+        rng = random.Random(rng_seed)
         names = list(iterators.keys())
         prob_list = [probs[n] for n in names]
 
@@ -179,9 +209,15 @@ class StreamingMedicalDataset(IterableDataset):
                 if total > 0:
                     prob_list = [p / total for p in prob_list]
 
-    def _tokenize_and_chunk(self, texts: Iterator[str]) -> Iterator[List[int]]:
+    def _tokenize_and_chunk(
+        self,
+        texts: Iterator[str],
+        shard_id: int = 0,
+        num_shards: int = 1,
+    ) -> Iterator[List[int]]:
         """Tokenize texts and create fixed-length chunks."""
         buffer = []
+        chunk_idx = 0
 
         for text in texts:
             tokens = self.tokenizer.encode(text, disallowed_special=())
@@ -190,7 +226,9 @@ class StreamingMedicalDataset(IterableDataset):
 
             # Yield complete chunks
             while len(buffer) >= self.seq_length:
-                yield buffer[:self.seq_length]
+                if chunk_idx % max(1, num_shards) == shard_id:
+                    yield buffer[:self.seq_length]
+                chunk_idx += 1
                 buffer = buffer[self.seq_length:]
 
     def __iter__(self) -> Iterator[tuple]:
@@ -200,15 +238,27 @@ class StreamingMedicalDataset(IterableDataset):
 
         if worker_info is not None:
             # Adjust seed per worker for different data
-            worker_seed = self.seed + worker_info.id
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
         else:
-            worker_seed = self.seed
+            worker_id = 0
+            num_workers = 1
+
+        # DDP rank/world size (if launched with torchrun)
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # Global shard ID across all workers and ranks
+        shard_id = rank * num_workers + worker_id
+        num_shards = max(1, world_size * num_workers)
+
+        worker_seed = self.seed + shard_id
 
         random.seed(worker_seed)
 
         # Stream, tokenize, and chunk
-        texts = self._interleave_datasets()
-        chunks = self._tokenize_and_chunk(texts)
+        texts = self._interleave_datasets(worker_seed)
+        chunks = self._tokenize_and_chunk(texts, shard_id=shard_id, num_shards=num_shards)
 
         for chunk in chunks:
             tokens = torch.tensor(chunk, dtype=torch.long)

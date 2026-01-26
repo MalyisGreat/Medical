@@ -47,8 +47,8 @@ from model import (
     MedicalLLM, ModelConfig,
     get_tiny_config, get_small_config, get_medium_config, get_baguette_config
 )
-from data_loader import MedicalPretrainDataLoader
-from streaming_loader import StreamingMedicalDataset
+from data_loader import MedicalPretrainDataLoader, MEDICAL_DATASETS
+from streaming_loader import StreamingMedicalDataset, STREAMING_DATASETS
 
 
 # =============================================================================
@@ -90,9 +90,7 @@ class Muon(torch.optim.Optimizer):
     Reference: https://github.com/KellerJordan/modded-nanogpt
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 ns_steps=5, adamw_params=None, adamw_lr=3e-4,
-                 adamw_betas=(0.9, 0.95), adamw_wd=0.1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         """
         Args:
             params: Parameters to optimize with Muon (typically attention/MLP weights)
@@ -100,26 +98,9 @@ class Muon(torch.optim.Optimizer):
             momentum: Momentum factor
             nesterov: Use Nesterov momentum
             ns_steps: Newton-Schulz iteration steps
-            adamw_params: Parameters to optimize with AdamW (embeddings, norms)
-            adamw_lr: Learning rate for AdamW params
-            adamw_betas: Betas for AdamW
-            adamw_wd: Weight decay for AdamW
         """
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(params, defaults)
-
-        # Separate AdamW optimizer for embeddings/norms
-        self.adamw_params = list(adamw_params) if adamw_params else []
-        if self.adamw_params:
-            self.adamw = torch.optim.AdamW(
-                self.adamw_params,
-                lr=adamw_lr,
-                betas=adamw_betas,
-                weight_decay=adamw_wd,
-                fused=torch.cuda.is_available()
-            )
-        else:
-            self.adamw = None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -160,16 +141,10 @@ class Muon(torch.optim.Optimizer):
 
                 p.add_(g, alpha=-lr)
 
-        # Step the AdamW optimizer for embeddings/norms
-        if self.adamw is not None:
-            self.adamw.step()
-
         return loss
 
     def zero_grad(self, set_to_none=True):
         super().zero_grad(set_to_none=set_to_none)
-        if self.adamw is not None:
-            self.adamw.zero_grad(set_to_none=set_to_none)
 
 
 @dataclass
@@ -438,6 +413,13 @@ def train(config: TrainConfig):
     # Track datasets used (for checkpoint metadata)
     datasets_to_use = config.datasets or ["wikitext"]
 
+    # Validate datasets for non-sharded runs
+    if config.data_dir is None:
+        available = STREAMING_DATASETS if config.streaming else MEDICAL_DATASETS
+        unknown = [d for d in datasets_to_use if d not in available]
+        if unknown:
+            raise ValueError(f"Unknown datasets: {unknown}. Available: {sorted(available.keys())}")
+
     if config.streaming:
         # FASTEST: Stream directly from HuggingFace (no prep needed)
         print_main(f"Streaming mode: datasets={datasets_to_use}", rank)
@@ -498,7 +480,10 @@ def train(config: TrainConfig):
 
         # Create or load cached data
         dataset_hash = "_".join(sorted(datasets_to_use))
-        cache_file = os.path.join(config.data_cache, f"train_chunks_{dataset_hash}_{config.max_tokens}.pt")
+        cache_file = os.path.join(
+            config.data_cache,
+            f"train_chunks_{dataset_hash}_{config.max_tokens}_seq{config.max_seq_length}.pt",
+        )
 
         if os.path.exists(cache_file):
             print_main(f"Loading cached data from {cache_file}", rank)
@@ -581,6 +566,7 @@ def train(config: TrainConfig):
 
     # Choose optimizer
     use_fused = torch.cuda.is_available() and 'cuda' in device
+    adamw_optimizer = None
     if config.optimizer == "muon":
         optimizer = Muon(
             muon_params,
@@ -588,11 +574,15 @@ def train(config: TrainConfig):
             momentum=0.95,
             nesterov=True,
             ns_steps=5,
-            adamw_params=adamw_params,
-            adamw_lr=config.learning_rate,
-            adamw_betas=(config.beta1, config.beta2),
-            adamw_wd=0.0,  # No weight decay on embeddings/norms
         )
+        if adamw_params:
+            adamw_optimizer = torch.optim.AdamW(
+                adamw_params,
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                weight_decay=0.0,  # No weight decay on embeddings/norms
+                fused=use_fused,
+            )
         print_main(f"\nOptimizer: Muon (speedrun mode!)", rank)
         print_main(f"  Muon LR: {config.muon_lr}", rank)
         print_main(f"  AdamW LR: {config.learning_rate} (for embeddings/norms)", rank)
@@ -620,10 +610,21 @@ def train(config: TrainConfig):
         print_main(f"  Decayed params: {sum(p.numel() for p in decay_params):,}", rank)
         print_main(f"  Non-decayed params: {sum(p.numel() for p in no_decay_params):,}", rank)
 
-    # Load optimizer state if resuming (only for AdamW - Muon doesn't save state well)
-    if config.resume and 'optimizer_state_dict' in checkpoint and config.optimizer == "adamw":
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print_main("  Loaded optimizer state", rank)
+    # Load optimizer state if resuming
+    if config.resume:
+        if config.optimizer == "adamw" and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print_main("  Loaded optimizer state", rank)
+        elif config.optimizer == "muon":
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print_main("  Loaded Muon optimizer state", rank)
+                except Exception as e:
+                    print_main(f"  Warning: could not load Muon state: {e}", rank)
+            if adamw_optimizer is not None and 'adamw_state_dict' in checkpoint:
+                adamw_optimizer.load_state_dict(checkpoint['adamw_state_dict'])
+                print_main("  Loaded AdamW optimizer state", rank)
 
     # Gradient accumulation info
     if config.grad_accum_steps > 1:
@@ -696,22 +697,41 @@ def train(config: TrainConfig):
             # Only step optimizer after accumulation is complete
             if not is_accum_step:
                 # Update learning rate
-                base_lr = config.muon_lr if config.optimizer == "muon" else config.learning_rate
-                lr = get_lr(step, config.warmup_steps, lr_decay_steps, base_lr)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr
+                if config.optimizer == "muon":
+                    muon_lr = get_lr(step, config.warmup_steps, lr_decay_steps, config.muon_lr)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = muon_lr
+                    if adamw_optimizer is not None:
+                        adamw_lr = get_lr(step, config.warmup_steps, lr_decay_steps, config.learning_rate)
+                        for param_group in adamw_optimizer.param_groups:
+                            param_group['lr'] = adamw_lr
+                    lr = muon_lr
+                else:
+                    lr = get_lr(step, config.warmup_steps, lr_decay_steps, config.learning_rate)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr
 
                 # Gradient clipping and optimizer step
                 if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                    scaler.step(optimizer)
+                    if adamw_optimizer is not None:
+                        scaler.unscale_(adamw_optimizer)
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    if torch.isfinite(total_norm).item():
+                        scaler.step(optimizer)
+                        if adamw_optimizer is not None:
+                            scaler.step(adamw_optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                    optimizer.step()
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    if torch.isfinite(total_norm).item():
+                        optimizer.step()
+                        if adamw_optimizer is not None:
+                            adamw_optimizer.step()
 
                 optimizer.zero_grad(set_to_none=True)
+                if adamw_optimizer is not None:
+                    adamw_optimizer.zero_grad(set_to_none=True)
 
                 # Accumulate stats
                 total_loss += accum_loss
@@ -777,6 +797,7 @@ def train(config: TrainConfig):
                         'step': step,
                         'model_state_dict': raw_model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'adamw_state_dict': adamw_optimizer.state_dict() if adamw_optimizer is not None else None,
                         'loss': best_loss,
                         'config': model_config,
                         'train_config': {
@@ -795,6 +816,7 @@ def train(config: TrainConfig):
                     'step': step,
                     'model_state_dict': raw_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'adamw_state_dict': adamw_optimizer.state_dict() if adamw_optimizer is not None else None,
                     'loss': best_loss,
                     'config': model_config,
                     'train_config': {
@@ -859,6 +881,8 @@ def main():
                         help="Total training tokens")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size per device")
+    parser.add_argument("--max_seq_length", type=int, default=512,
+                        help="Maximum sequence length")
     parser.add_argument("--max_steps", type=int, default=100,
                         help="Maximum training steps")
     parser.add_argument("--lr", type=float, default=3e-4,
@@ -915,6 +939,7 @@ def main():
         datasets=datasets if datasets else None,
         max_tokens=args.max_tokens,
         batch_size=args.batch_size,
+        max_seq_length=args.max_seq_length,
         max_steps=args.max_steps,
         optimizer=args.optimizer,
         learning_rate=args.lr,
@@ -940,8 +965,8 @@ def main():
             print("-" * 60)
 
             loader = MedicalPretrainDataLoader(max_seq_length=config.max_seq_length)
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            test_generation(model, loader, device)
+            model_device = next(model.parameters()).device
+            test_generation(model, loader, device=str(model_device))
 
 
 if __name__ == "__main__":

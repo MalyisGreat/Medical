@@ -2,6 +2,7 @@
 data_cache/
 *.pt
 *.bin
+data_shards_test/
 
 # Output
 output/
@@ -31,6 +32,7 @@ Thumbs.db
 *.log
 wandb/
 runs/
+research/logs/
 
 # Environment
 .env

@@ -20,13 +20,15 @@ import time
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import List, Iterator, Dict, Any
+from typing import List, Iterator, Dict, Any, Optional
 import random
 import multiprocessing as mp
 from functools import partial
+import fnmatch
+import math
 
 import tiktoken
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, HfApi
 from datasets import load_dataset
 
 # Global tokenizer for multiprocessing (initialized per worker)
@@ -57,6 +59,11 @@ DATASET_CONFIGS = {
     "synth": {
         "repo_id": "PleIAs/SYNTH",
         "weight": 0.40,
+        "file_pattern": "synth_*.parquet",
+    },
+    "pubmed": {
+        "repo_id": "ncbi/pubmed",
+        "weight": 0.30,
     },
     "guidelines": {
         "repo_id": "epfl-llm/guidelines",
@@ -66,10 +73,16 @@ DATASET_CONFIGS = {
         "repo_id": "ywchoi/OpenMedText",
         "weight": 0.10,
     },
+    "fineweb_edu": {
+        "repo_id": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "weight": 0.05,
+    },
     "wikitext": {
         "repo_id": "wikitext",
         "name": "wikitext-2-raw-v1",
         "weight": 1.0,
+        "file_pattern": None,
     },
 }
 
@@ -99,15 +112,146 @@ def format_guidelines(example: Dict[str, Any]) -> str:
         return f"Clinical Guideline: {title}\n\n{text}"
     return text
 
+def format_pubmed(example: Dict[str, Any]) -> str:
+    """Format PubMed abstract with title."""
+    try:
+        citation = example.get("MedlineCitation", {})
+        article = citation.get("Article", {})
+
+        title = article.get("ArticleTitle", "")
+        abstract = article.get("Abstract", {})
+        abstract_text = abstract.get("AbstractText", "")
+
+        if isinstance(abstract_text, list):
+            abstract_text = " ".join(str(t) for t in abstract_text if t)
+
+        if title and abstract_text:
+            return f"Title: {title}\n\nAbstract: {abstract_text}"
+        return abstract_text or title or ""
+    except Exception:
+        return ""
+
 
 def format_example(example: Dict[str, Any], dataset_name: str) -> str:
     """Format example based on dataset type."""
     if dataset_name == "synth":
         return format_synth(example)
+    elif dataset_name == "pubmed":
+        return format_pubmed(example)
     elif dataset_name == "guidelines":
         return format_guidelines(example)
     else:
         return example.get("text", "")
+
+
+class ShardWriter:
+    """Stream tokens into sharded binary files without large memory spikes."""
+
+    def __init__(
+        self,
+        output_dir: str,
+        seq_length: int,
+        shard_size: int,
+        seed: int = 42,
+        shuffle_buffer: int = 4096,
+    ):
+        self.output_path = Path(output_dir)
+        self.seq_length = seq_length
+        self.shard_size = shard_size
+        self.chunks_per_shard = max(1, shard_size // seq_length)
+        self.shuffle_buffer = shuffle_buffer
+        self.rng = random.Random(seed)
+
+        self.token_buffer: List[int] = []
+        self.chunk_buffer: List[List[int]] = []
+        self.shard_idx = 0
+        self.current_chunks = 0
+        self.total_chunks = 0
+        self.total_tokens = 0
+        self.shard_files: List[str] = []
+        self.shard_fh = None
+        self.current_shard_path: Optional[Path] = None
+
+        self._open_shard()
+
+    def _open_shard(self):
+        self.current_chunks = 0
+        self.current_shard_path = self.output_path / f"shard_{self.shard_idx:04d}.bin"
+        self.shard_fh = open(self.current_shard_path, "wb")
+        self.shard_files.append(self.current_shard_path.name)
+
+    def _close_shard(self, remove_if_empty: bool = False):
+        if self.shard_fh is not None:
+            self.shard_fh.close()
+            self.shard_fh = None
+        if remove_if_empty or self.current_chunks == 0:
+            try:
+                if self.current_shard_path and self.current_shard_path.exists():
+                    os.remove(self.current_shard_path)
+            except OSError:
+                pass
+            if self.shard_files and self.current_shard_path:
+                if self.shard_files[-1] == self.current_shard_path.name:
+                    self.shard_files.pop()
+
+    def _flush_chunks(self):
+        if not self.chunk_buffer:
+            return
+
+        self.rng.shuffle(self.chunk_buffer)
+
+        while self.chunk_buffer:
+            remaining = self.chunks_per_shard - self.current_chunks
+            to_write = self.chunk_buffer[:remaining]
+            if not to_write:
+                break
+
+            arr = np.asarray(to_write, dtype=np.uint32)
+            arr.tofile(self.shard_fh)
+
+            wrote = len(to_write)
+            self.current_chunks += wrote
+            self.total_chunks += wrote
+            self.total_tokens += wrote * self.seq_length
+            self.chunk_buffer = self.chunk_buffer[remaining:]
+
+            if self.current_chunks >= self.chunks_per_shard:
+                self._close_shard(remove_if_empty=False)
+                self.shard_idx += 1
+                self._open_shard()
+
+    def add_tokens(self, tokens: List[int]):
+        self.token_buffer.extend(tokens)
+
+        while len(self.token_buffer) >= self.seq_length:
+            chunk = self.token_buffer[:self.seq_length]
+            self.token_buffer = self.token_buffer[self.seq_length:]
+            self.chunk_buffer.append(chunk)
+
+            if len(self.chunk_buffer) >= self.shuffle_buffer:
+                self._flush_chunks()
+
+    def finalize(self):
+        # Drop leftover tokens that don't fill a chunk
+        self.token_buffer = []
+        self._flush_chunks()
+        if self.current_chunks == 0:
+            self._close_shard(remove_if_empty=True)
+        else:
+            self._close_shard(remove_if_empty=False)
+
+
+def _select_repo_files(repo_id: str, pattern: str, pct: float) -> List[str]:
+    """Select the first pct% of repo files matching a pattern."""
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    matched = sorted([f for f in files if fnmatch.fnmatch(f, pattern)])
+    if not matched:
+        return []
+    if pct <= 0 or pct > 100:
+        raise ValueError(f"subset pct must be in (0, 100], got {pct}")
+    k = max(1, int(math.floor(len(matched) * (pct / 100.0))))
+    return matched[:k]
 
 
 def fast_download_dataset(
@@ -117,7 +261,9 @@ def fast_download_dataset(
     tokenizer,
     download_workers: int = 8,
     tokenize_workers: int = None,
-) -> List[int]:
+    writer: Optional[ShardWriter] = None,
+    subset_pct: Optional[float] = None,
+) -> int:
     """
     Download dataset FAST using snapshot_download with parallel workers.
     Then load and tokenize with PARALLEL multiprocessing.
@@ -127,16 +273,26 @@ def fast_download_dataset(
 
     config = DATASET_CONFIGS[dataset_name]
     repo_id = config["repo_id"]
+    file_pattern = config.get("file_pattern")
+    subset_files = None
 
     print(f"\n[{dataset_name}] Downloading with {download_workers} parallel workers...")
     start_time = time.time()
 
-    # Step 1: Fast parallel download of all files
+    # Step 1: Fast parallel download of selected files
     try:
+        allow_patterns = None
+        if subset_pct and file_pattern:
+            subset_files = _select_repo_files(repo_id, file_pattern, subset_pct)
+            if not subset_files:
+                raise ValueError(f"No files matched pattern {file_pattern}")
+            allow_patterns = subset_files
+
         cache_dir = snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
             max_workers=download_workers,  # Parallel file downloads!
+            allow_patterns=allow_patterns,
         )
         download_time = time.time() - start_time
         print(f"[{dataset_name}] Download complete in {download_time:.1f}s")
@@ -151,85 +307,115 @@ def fast_download_dataset(
 
     try:
         if cache_dir:
-            ds = load_dataset(repo_id, config.get("name"), split="train")
+            if subset_files:
+                ds = load_dataset(
+                    repo_id,
+                    config.get("name"),
+                    split="train",
+                    data_files={"train": subset_files},
+                )
+            else:
+                ds = load_dataset(repo_id, config.get("name"), split="train")
         else:
-            ds = load_dataset(repo_id, config.get("name"), split="train", streaming=True)
+            if subset_files:
+                ds = load_dataset(
+                    repo_id,
+                    config.get("name"),
+                    split="train",
+                    streaming=True,
+                    data_files={"train": subset_files},
+                )
+            else:
+                ds = load_dataset(repo_id, config.get("name"), split="train", streaming=True)
     except Exception as e:
         print(f"[{dataset_name}] Error loading: {e}")
         return []
 
-    # Step 3: Collect texts (estimate how many we need based on avg tokens per text)
+    # Step 3: Stream texts and tokenize in parallel
     # Assume ~200 tokens per text on average, collect 2x what we need
     estimated_texts_needed = (target_tokens // 200) * 2
-    print(f"[{dataset_name}] Collecting texts (target: ~{estimated_texts_needed:,} texts)...")
+    print(f"[{dataset_name}] Streaming texts (target: ~{estimated_texts_needed:,} texts)...")
 
-    texts = []
-    collect_start = time.time()
-    last_print = time.time()
+    def iter_text_batches(batch_size: int, max_texts: int):
+        batch = []
+        count = 0
+        for example in ds:
+            text = format_example(example, dataset_name)
+            if len(text) < 50:
+                continue
+            batch.append(text)
+            count += 1
 
-    for example in ds:
-        text = format_example(example, dataset_name)
-        if len(text) < 50:
-            continue
-        texts.append(text)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
 
-        if len(texts) >= estimated_texts_needed:
-            break
-
-        # Progress every 5 seconds
-        now = time.time()
-        if now - last_print > 5:
-            print(f"[{dataset_name}] Collected {len(texts):,} texts...")
-            last_print = now
-
-    collect_time = time.time() - collect_start
-    print(f"[{dataset_name}] Collected {len(texts):,} texts in {collect_time:.1f}s")
-
-    if not texts:
-        return []
-
-    # Step 4: Parallel tokenization
-    print(f"[{dataset_name}] Tokenizing with {tokenize_workers} parallel workers...")
-    tokenize_start = time.time()
-
-    # Split texts into batches for workers
-    batch_size = max(1000, len(texts) // tokenize_workers)
-    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
-
-    tokens = []
-    total_tokenized = 0
-
-    # Use multiprocessing pool (spawn context for Windows compatibility)
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=tokenize_workers, initializer=_init_tokenizer) as pool:
-        for batch_results in pool.imap(_tokenize_batch, batches):
-            for token_list in batch_results:
-                tokens.extend(token_list)
-                total_tokenized += 1
-
-                if len(tokens) >= target_tokens:
-                    break
-
-            if len(tokens) >= target_tokens:
+            if max_texts and count >= max_texts:
                 break
 
-            # Progress
+        if batch:
+            yield batch
+
+    print(f"[{dataset_name}] Tokenizing with {tokenize_workers} parallel workers...")
+    tokenize_start = time.time()
+    last_print = time.time()
+    tokens_collected = 0
+
+    batch_size = 1000
+    batches = iter_text_batches(batch_size, estimated_texts_needed)
+
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=tokenize_workers, initializer=_init_tokenizer)
+
+    try:
+        stop = False
+        for batch_results in pool.imap(_tokenize_batch, batches):
+            for token_list in batch_results:
+                if not token_list:
+                    continue
+                remaining = target_tokens - tokens_collected
+                if remaining <= 0:
+                    stop = True
+                    break
+
+                if len(token_list) > remaining:
+                    token_list = token_list[:remaining]
+
+                if writer is not None:
+                    writer.add_tokens(token_list)
+                tokens_collected += len(token_list)
+
+                if tokens_collected >= target_tokens:
+                    stop = True
+                    break
+
+            if stop:
+                break
+
             now = time.time()
             if now - last_print > 3:
-                progress = len(tokens) / target_tokens * 100
-                tok_per_sec = len(tokens) / (now - tokenize_start)
-                eta = (target_tokens - len(tokens)) / tok_per_sec / 60 if tok_per_sec > 0 else 0
-                print(f"[{dataset_name}] Tokenizing: {progress:.1f}% | {len(tokens)/1e6:.1f}M tokens | {tok_per_sec/1e6:.2f}M tok/s | ETA: {eta:.1f}min")
+                progress = tokens_collected / target_tokens * 100
+                tok_per_sec = tokens_collected / (now - tokenize_start) if now > tokenize_start else 0
+                eta = (target_tokens - tokens_collected) / tok_per_sec / 60 if tok_per_sec > 0 else 0
+                print(f"[{dataset_name}] Tokenizing: {progress:.1f}% | {tokens_collected/1e6:.1f}M tokens | {tok_per_sec/1e6:.2f}M tok/s | ETA: {eta:.1f}min")
                 last_print = now
+
+        if stop:
+            pool.terminate()
+        else:
+            pool.close()
+    finally:
+        pool.join()
 
     tokenize_time = time.time() - tokenize_start
     total_time = time.time() - start_time
 
-    print(f"[{dataset_name}] DONE: {len(tokens)/1e6:.1f}M tokens")
-    print(f"[{dataset_name}]   Tokenize: {tokenize_time:.1f}s ({len(tokens)/tokenize_time/1e6:.2f}M tok/s)")
+    print(f"[{dataset_name}] DONE: {tokens_collected/1e6:.1f}M tokens")
+    if tokenize_time > 0:
+        print(f"[{dataset_name}]   Tokenize: {tokenize_time:.1f}s ({tokens_collected/tokenize_time/1e6:.2f}M tok/s)")
     print(f"[{dataset_name}]   Total: {total_time:.1f}s")
 
-    return tokens[:target_tokens]
+    return tokens_collected
 
 
 def prepare_sharded_data(
@@ -241,6 +427,7 @@ def prepare_sharded_data(
     seed: int = 42,
     download_workers: int = 8,
     tokenize_workers: int = None,
+    synth_pct: Optional[float] = None,
 ):
     """
     Prepare training data as sharded binary files with FAST parallel downloads.
@@ -284,72 +471,47 @@ def prepare_sharded_data(
     print("-" * 60)
 
     start_time = time.time()
-    all_tokens = []
+    writer = ShardWriter(
+        output_dir=output_dir,
+        seq_length=seq_length,
+        shard_size=shard_size,
+        seed=seed,
+        shuffle_buffer=4096,
+    )
 
     # Download each dataset with fast parallel download + parallel tokenization
     for name in datasets:
         target = dataset_targets[name]
-        tokens = fast_download_dataset(
-            name, target, seq_length, tokenizer, download_workers, tokenize_workers
+        subset_pct = synth_pct if name == "synth" else None
+        tokens_collected = fast_download_dataset(
+            name,
+            target,
+            seq_length,
+            tokenizer,
+            download_workers,
+            tokenize_workers,
+            writer=writer,
+            subset_pct=subset_pct,
         )
-        all_tokens.extend(tokens)
-        print(f"  {name}: {len(tokens):,} tokens collected")
+        print(f"  {name}: {tokens_collected:,} tokens collected")
 
     download_time = time.time() - start_time
     print(f"\n" + "-" * 60)
     print(f"All downloads complete in {download_time:.1f}s ({download_time/60:.1f}min)")
     print("-" * 60)
 
-    print(f"\nTotal tokens collected: {len(all_tokens):,}")
-
-    # Create chunks
-    print(f"\nCreating chunks and shuffling...")
-
-    chunks = []
-    for i in range(0, len(all_tokens) - seq_length, seq_length):
-        chunk = all_tokens[i:i + seq_length]
-        if len(chunk) == seq_length:
-            chunks.append(chunk)
-
-    print(f"Created {len(chunks):,} chunks")
-
-    # Shuffle chunks
-    random.shuffle(chunks)
-
-    # Convert to numpy array
-    data = np.array(chunks, dtype=np.uint32)
-    print(f"Data shape: {data.shape}")
-    print(f"Data size: {data.nbytes / 1e9:.2f} GB")
-
-    # Save as shards
-    print(f"\n" + "-" * 60)
-    print("Saving shards...")
-    print("-" * 60)
-
-    chunks_per_shard = shard_size // seq_length
-    num_shards = (len(chunks) + chunks_per_shard - 1) // chunks_per_shard
-
-    for shard_idx in range(num_shards):
-        start_idx = shard_idx * chunks_per_shard
-        end_idx = min((shard_idx + 1) * chunks_per_shard, len(chunks))
-
-        shard_data = data[start_idx:end_idx]
-        shard_file = output_path / f"shard_{shard_idx:04d}.bin"
-
-        shard_data.tofile(shard_file)
-
-        shard_tokens = shard_data.shape[0] * seq_length
-        print(f"  Shard {shard_idx}: {shard_data.shape[0]:,} chunks, {shard_tokens:,} tokens")
+    print(f"\nFinalizing shards...")
+    writer.finalize()
 
     # Save metadata
     import json
     metadata = {
         "datasets": datasets,
-        "total_tokens": len(all_tokens),
-        "total_chunks": len(chunks),
+        "total_tokens": writer.total_tokens,
+        "total_chunks": writer.total_chunks,
         "seq_length": seq_length,
-        "num_shards": num_shards,
-        "shard_files": [f.name for f in output_path.glob("shard_*.bin")],
+        "num_shards": len(writer.shard_files),
+        "shard_files": writer.shard_files,
         "dtype": "uint32",
     }
 
@@ -361,9 +523,9 @@ def prepare_sharded_data(
     print(f"\n" + "=" * 60)
     print("Data Preparation Complete!")
     print("=" * 60)
-    print(f"Total chunks: {len(chunks):,}")
-    print(f"Total tokens: {len(chunks) * seq_length:,}")
-    print(f"Shards: {num_shards}")
+    print(f"Total chunks: {writer.total_chunks:,}")
+    print(f"Total tokens: {writer.total_tokens:,}")
+    print(f"Shards: {len(writer.shard_files)}")
     print(f"Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
     print(f"Output: {output_dir}")
     print(f"\nTo train, use:")
@@ -391,6 +553,8 @@ def main():
                         help="Number of parallel download workers (default: 8)")
     parser.add_argument("--tokenize_workers", type=int, default=None,
                         help="Number of parallel tokenization workers (default: auto)")
+    parser.add_argument("--synth_pct", type=float, default=None,
+                        help="Download only the first N%% of SYNTH shards (e.g., 30 for 30%)")
 
     args = parser.parse_args()
 
@@ -405,6 +569,7 @@ def main():
         seed=args.seed,
         download_workers=args.download_workers,
         tokenize_workers=args.tokenize_workers,
+        synth_pct=args.synth_pct,
     )
 
 

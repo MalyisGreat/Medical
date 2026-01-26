@@ -185,20 +185,26 @@ def load_medqa(num_questions: int = 10) -> List[Dict]:
 
         # Handle different dataset formats
         if "question" in item:
+            letter_to_idx = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+
+            # Get choices
+            choices = item.get("options", item.get("choices", []))
+            if isinstance(choices, dict):
+                # Options is dict like {'A': '...', 'B': '...'}
+                choices = [choices.get(k, "") for k in ["A", "B", "C", "D", "E"] if k in choices]
+
+            # Get correct answer index
+            answer_idx = item.get("answer_idx", "A")
+            if isinstance(answer_idx, str):
+                correct_idx = letter_to_idx.get(answer_idx.upper(), 0)
+            else:
+                correct_idx = int(answer_idx) if answer_idx else 0
+
             q = {
                 "question": item["question"],
-                "choices": item.get("options", item.get("choices", [])),
-                "correct_idx": item.get("answer_idx", 0),
+                "choices": choices,
+                "correct_idx": correct_idx,
             }
-
-            # Handle dict choices
-            if isinstance(q["choices"], dict):
-                q["choices"] = list(q["choices"].values())
-
-            # Handle answer as letter
-            if "answer" in item and isinstance(item["answer"], str):
-                letter_to_idx = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
-                q["correct_idx"] = letter_to_idx.get(item["answer"].upper(), 0)
 
             questions.append(q)
 
@@ -221,7 +227,7 @@ def load_medmcqa(num_questions: int = 10) -> List[Dict]:
         if i >= num_questions:
             break
 
-        # MedMCQA format: question, opa, opb, opc, opd, cop (correct option 1-4)
+        # MedMCQA format: question, opa, opb, opc, opd, cop (correct option 0-3)
         choices = [
             item.get("opa", ""),
             item.get("opb", ""),
@@ -229,7 +235,7 @@ def load_medmcqa(num_questions: int = 10) -> List[Dict]:
             item.get("opd", ""),
         ]
 
-        correct_idx = item.get("cop", 1) - 1  # cop is 1-indexed
+        correct_idx = item.get("cop", 0)  # cop is 0-indexed
 
         questions.append({
             "question": item["question"],

@@ -28,6 +28,7 @@ import time
 import math
 import json
 import argparse
+import csv
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -352,6 +353,27 @@ def train(config: TrainConfig):
         os.makedirs(config.output_dir, exist_ok=True)
         os.makedirs(config.data_cache, exist_ok=True)
 
+    # Metrics logging (CSV)
+    metrics_path = os.path.join(config.output_dir, "metrics.csv")
+    metrics_writer = None
+    metrics_fh = None
+    if is_main_process(rank):
+        file_exists = os.path.exists(metrics_path)
+        metrics_fh = open(metrics_path, "a", newline="")
+        metrics_writer = csv.writer(metrics_fh)
+        if not file_exists:
+            metrics_writer.writerow([
+                "step",
+                "mode",
+                "loss",
+                "tokens_processed",
+                "elapsed_sec",
+                "lr",
+                "step_time_sec",
+                "tokens_per_sec",
+                "tokens_per_sec_overall",
+            ])
+
     # Sync before proceeding
     if ddp:
         dist.barrier()
@@ -640,6 +662,7 @@ def train(config: TrainConfig):
     step = start_step
     total_loss = 0.0
     start_time = time.time()
+    last_step_time = start_time
     tokens_processed = 0
 
     # Cap at 10 epochs for non-streaming, or just use max_steps for streaming
@@ -696,6 +719,9 @@ def train(config: TrainConfig):
 
             # Only step optimizer after accumulation is complete
             if not is_accum_step:
+                step_tokens = inputs.numel() * world_size * config.grad_accum_steps
+                step_loss = accum_loss / max(1, config.grad_accum_steps)
+
                 # Update learning rate
                 if config.optimizer == "muon":
                     muon_lr = get_lr(step, config.warmup_steps, lr_decay_steps, config.muon_lr)
@@ -733,11 +759,32 @@ def train(config: TrainConfig):
                 if adamw_optimizer is not None:
                     adamw_optimizer.zero_grad(set_to_none=True)
 
+                step_end = time.time()
+                step_time = step_end - last_step_time
+                last_step_time = step_end
+                step_tokens_per_sec = step_tokens / step_time if step_time > 0 else 0.0
+
                 # Accumulate stats
-                total_loss += accum_loss
-                tokens_processed += inputs.numel() * world_size * config.grad_accum_steps
+                total_loss += step_loss
+                tokens_processed += step_tokens
                 step += 1
                 accum_loss = 0.0
+
+                if metrics_writer is not None:
+                    elapsed = time.time() - start_time
+                    overall_tokens_per_sec = tokens_processed / elapsed if elapsed > 0 else 0.0
+                    metrics_writer.writerow([
+                        step,
+                        "train",
+                        f"{step_loss:.6f}",
+                        tokens_processed,
+                        f"{elapsed:.2f}",
+                        f"{lr:.6e}",
+                        f"{step_time:.4f}",
+                        f"{step_tokens_per_sec:.2f}",
+                        f"{overall_tokens_per_sec:.2f}",
+                    ])
+                    metrics_fh.flush()
 
             # Logging (only after optimizer step)
             if not is_accum_step and step % config.log_interval == 0 and step > 0:
@@ -750,6 +797,17 @@ def train(config: TrainConfig):
                       f"LR: {lr:.2e} | "
                       f"Tokens/s: {tokens_per_sec:.0f} | "
                       f"Time: {elapsed:.1f}s", rank)
+
+                if metrics_writer is not None:
+                    metrics_writer.writerow([
+                        step,
+                        "train",
+                        f"{avg_loss:.6f}",
+                        tokens_processed,
+                        f"{elapsed:.2f}",
+                        f"{lr:.6e}",
+                    ])
+                    metrics_fh.flush()
 
                 total_loss = 0.0
 
@@ -790,6 +848,20 @@ def train(config: TrainConfig):
                     print_main(f"  Train loss: {avg_eval_loss:.4f} (streaming mode)", rank)
                     if avg_eval_loss < best_loss:
                         best_loss = avg_eval_loss
+
+                if metrics_writer is not None:
+                    metrics_writer.writerow([
+                        step,
+                        "eval",
+                        f"{avg_eval_loss:.6f}",
+                        tokens_processed,
+                        f"{time.time() - start_time:.2f}",
+                        f"{lr:.6e}",
+                        "",
+                        "",
+                        "",
+                    ])
+                    metrics_fh.flush()
 
                 # Save best model if improved (only on main process)
                 if avg_eval_loss <= best_loss and is_main_process(rank):
@@ -842,6 +914,8 @@ def train(config: TrainConfig):
     print_main(f"Output: {config.output_dir}", rank)
 
     # Cleanup DDP
+    if metrics_fh is not None:
+        metrics_fh.close()
     cleanup_distributed()
 
     return raw_model

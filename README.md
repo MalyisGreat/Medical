@@ -96,6 +96,12 @@ torchrun --nproc_per_node=8 train.py \
     --compile
 ```
 
+### 10B tokens on 4x H100 (full dataset download)
+```bash
+# Linux bash script (downloads full datasets, then trains to 10B tokens)
+./scripts/run_4xh100_10b.sh
+```
+
 ### Local testing
 ```bash
 # Quick streaming test

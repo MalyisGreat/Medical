@@ -16,8 +16,8 @@ import random
 from typing import Optional, List, Iterator, Dict, Any
 from dataclasses import dataclass
 
-# Disable hf_transfer to avoid issues
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+# Enable hf_transfer if installed (5-10x faster downloads)
+# pip install hf_transfer && set HF_HUB_ENABLE_HF_TRANSFER=1
 
 from datasets import load_dataset, Dataset, IterableDataset, concatenate_datasets
 import tiktoken

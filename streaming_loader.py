@@ -16,8 +16,8 @@ import torch
 from torch.utils.data import IterableDataset, DataLoader
 import tiktoken
 
-# Disable hf_transfer
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+# Enable hf_transfer if installed (5-10x faster downloads)
+# pip install hf_transfer && set HF_HUB_ENABLE_HF_TRANSFER=1
 
 from datasets import load_dataset
 

@@ -184,7 +184,7 @@ class StreamingMedicalDataset(IterableDataset):
         buffer = []
 
         for text in texts:
-            tokens = self.tokenizer.encode(text, allowed_special=set())
+            tokens = self.tokenizer.encode(text, disallowed_special=())
             tokens.append(self.eos_token)
             buffer.extend(tokens)
 

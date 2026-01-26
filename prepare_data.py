@@ -5,6 +5,7 @@ Downloads and tokenizes data into sharded binary files for efficient training.
 Run this BEFORE training on H100s to avoid download bottlenecks.
 
 PARALLEL DOWNLOADS: Uses multiprocessing to download datasets simultaneously.
+SPLIT LARGE DATASETS: Can split a single large dataset (like SYNTH) across multiple workers.
 
 Usage:
     # Prepare 5B tokens (for full training)
@@ -12,6 +13,9 @@ Usage:
 
     # Prepare 100M tokens (for testing)
     python prepare_data.py --max_tokens 100000000 --datasets synth
+
+    # FAST: Split SYNTH across 4 parallel workers
+    python prepare_data.py --max_tokens 2000000000 --datasets synth,guidelines --split_workers 4
 """
 
 import os
@@ -27,25 +31,27 @@ import tempfile
 from data_loader import MedicalPretrainDataLoader, MEDICAL_DATASETS
 
 
-def download_dataset(args: Tuple[str, int, int, str]) -> Tuple[str, str, int]:
+def download_dataset_chunk(args: Tuple[str, int, int, str, int, int]) -> Tuple[str, str, int]:
     """
-    Download and tokenize a single dataset (runs in parallel).
+    Download and tokenize a chunk of a dataset (runs in parallel).
 
     Args:
-        args: (dataset_name, target_tokens, seq_length, temp_dir)
+        args: (dataset_name, target_tokens, seq_length, temp_dir, worker_id, skip_samples)
 
     Returns:
-        (dataset_name, temp_file_path, token_count)
+        (worker_name, temp_file_path, token_count)
     """
-    dataset_name, target_tokens, seq_length, temp_dir = args
+    dataset_name, target_tokens, seq_length, temp_dir, worker_id, skip_samples = args
 
-    print(f"\n[{dataset_name}] Starting download...")
+    worker_name = f"{dataset_name}_{worker_id}" if worker_id > 0 else dataset_name
+
+    print(f"\n[{worker_name}] Starting download (skip {skip_samples:,} samples)...")
 
     # Initialize loader for this process
     loader = MedicalPretrainDataLoader(
         datasets=[dataset_name],
         max_seq_length=seq_length,
-        seed=42,
+        seed=42 + worker_id,  # Different seed per worker
     )
 
     target_samples = (target_tokens // seq_length) * 2
@@ -53,11 +59,17 @@ def download_dataset(args: Tuple[str, int, int, str]) -> Tuple[str, str, int]:
     dataset_tokens = []
     token_count = 0
     sample_count = 0
+    skipped = 0
     start_time = time.time()
     last_print = start_time
 
     try:
-        for text in loader.load_dataset_samples(dataset_name, max_samples=target_samples):
+        for text in loader.load_dataset_samples(dataset_name, max_samples=skip_samples + target_samples):
+            # Skip samples assigned to other workers
+            if skipped < skip_samples:
+                skipped += 1
+                continue
+
             tokens = loader.tokenize_text(text)
             eos = loader.tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[0]
             tokens.append(eos)
@@ -76,22 +88,24 @@ def download_dataset(args: Tuple[str, int, int, str]) -> Tuple[str, str, int]:
                 tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
                 progress_pct = (token_count / target_tokens) * 100
                 eta_min = ((target_tokens - token_count) / tokens_per_sec / 60) if tokens_per_sec > 0 else 0
-                print(f"[{dataset_name}] {progress_pct:5.1f}% | {token_count/1e6:.1f}M tokens | {tokens_per_sec/1e6:.2f}M tok/s | ETA: {eta_min:.1f}min")
+                print(f"[{worker_name}] {progress_pct:5.1f}% | {token_count/1e6:.1f}M tokens | {tokens_per_sec/1e6:.2f}M tok/s | ETA: {eta_min:.1f}min")
                 last_print = now
 
         elapsed = time.time() - start_time
         tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
-        print(f"[{dataset_name}] DONE: {token_count/1e6:.1f}M tokens in {elapsed:.1f}s ({tokens_per_sec/1e6:.2f}M tok/s)")
+        print(f"[{worker_name}] DONE: {token_count/1e6:.1f}M tokens in {elapsed:.1f}s ({tokens_per_sec/1e6:.2f}M tok/s)")
 
         # Save to temp file
-        temp_file = os.path.join(temp_dir, f"{dataset_name}_tokens.npy")
+        temp_file = os.path.join(temp_dir, f"{worker_name}_tokens.npy")
         np.array(dataset_tokens[:target_tokens], dtype=np.uint32).tofile(temp_file)
 
-        return dataset_name, temp_file, min(token_count, target_tokens)
+        return worker_name, temp_file, min(token_count, target_tokens)
 
     except Exception as e:
-        print(f"[{dataset_name}] ERROR: {e}")
-        return dataset_name, None, 0
+        print(f"[{worker_name}] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return worker_name, None, 0
 
 
 def prepare_sharded_data(
@@ -102,9 +116,13 @@ def prepare_sharded_data(
     seq_length: int = 512,
     seed: int = 42,
     num_workers: int = None,
+    split_workers: int = 1,  # How many workers to split large datasets across
 ):
     """
     Prepare training data as sharded binary files with PARALLEL downloads.
+
+    Args:
+        split_workers: Split large datasets (like SYNTH) across this many workers for faster download.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -112,16 +130,12 @@ def prepare_sharded_data(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Use number of datasets as workers (each dataset downloads in parallel)
-    if num_workers is None:
-        num_workers = min(len(datasets), cpu_count())
-
     print("=" * 60)
     print("Preparing Training Data (PARALLEL MODE)")
     print("=" * 60)
     print(f"Datasets: {datasets}")
     print(f"Target tokens: {max_tokens:,}")
-    print(f"Parallel workers: {num_workers}")
+    print(f"Split workers per dataset: {split_workers}")
     print(f"Shard size: {shard_size:,} tokens")
     print(f"Sequence length: {seq_length}")
     print(f"Output: {output_dir}")
@@ -146,18 +160,42 @@ def prepare_sharded_data(
     # Create temp directory for intermediate files
     with tempfile.TemporaryDirectory() as temp_dir:
         # Prepare args for parallel download
-        download_args = [
-            (name, dataset_targets[name], seq_length, temp_dir)
-            for name in datasets
-        ]
+        # Split large datasets across multiple workers
+        download_args = []
+
+        for name in datasets:
+            target = dataset_targets[name]
+
+            # Only split large datasets (SYNTH) and if split_workers > 1
+            if split_workers > 1 and name == "synth" and target > 100_000_000:
+                # Split SYNTH across multiple workers
+                tokens_per_worker = target // split_workers
+                samples_per_worker = tokens_per_worker // seq_length * 2
+
+                print(f"\n  Splitting {name} across {split_workers} workers ({tokens_per_worker/1e6:.0f}M tokens each)")
+
+                for i in range(split_workers):
+                    skip = i * samples_per_worker
+                    worker_tokens = tokens_per_worker if i < split_workers - 1 else target - (tokens_per_worker * i)
+                    download_args.append((name, worker_tokens, seq_length, temp_dir, i, skip))
+            else:
+                # Single worker for this dataset
+                download_args.append((name, target, seq_length, temp_dir, 0, 0))
+
+        total_workers = len(download_args)
+        if num_workers is None:
+            num_workers = min(total_workers, cpu_count())
+
+        print(f"\nTotal parallel downloads: {total_workers}")
+        print(f"Worker pool size: {num_workers}")
 
         # Download in parallel
-        if num_workers > 1 and len(datasets) > 1:
+        if num_workers > 1 and total_workers > 1:
             with Pool(num_workers) as pool:
-                results = pool.map(download_dataset, download_args)
+                results = pool.map(download_dataset_chunk, download_args)
         else:
             # Sequential for single dataset
-            results = [download_dataset(args) for args in download_args]
+            results = [download_dataset_chunk(args) for args in download_args]
 
         download_time = time.time() - start_time
         print(f"\n" + "-" * 60)
@@ -264,7 +302,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--workers", type=int, default=None,
-                        help="Number of parallel workers (default: num datasets)")
+                        help="Number of parallel workers (default: auto)")
+    parser.add_argument("--split_workers", type=int, default=1,
+                        help="Split large datasets (SYNTH) across N workers (default: 1, try 4 for faster)")
 
     args = parser.parse_args()
 
@@ -278,6 +318,7 @@ def main():
         seq_length=args.seq_length,
         seed=args.seed,
         num_workers=args.workers,
+        split_workers=args.split_workers,
     )
 
 

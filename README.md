@@ -131,7 +131,22 @@ Test on medical benchmarks (not used in training):
 - MedQA (USMLE)
 - MedMCQA
 - PubMedQA
-- MMLU medical subset
+
+### Quick evaluation (10 questions)
+```bash
+python evaluate.py --checkpoint output/checkpoint_10000.pt --num_questions 10
+```
+
+### Full evaluation
+```bash
+python evaluate.py --checkpoint output/checkpoint_10000.pt --num_questions 500
+```
+
+### Options
+- `--model`: Model config (tiny/small/medium/baguette)
+- `--benchmarks`: Which benchmarks to run (default: medqa,medmcqa,pubmedqa)
+- `--no_reasoning`: Don't use reasoning format (just raw completion)
+- `--device`: cuda or cpu
 
 ## References
 

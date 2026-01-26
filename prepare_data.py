@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import time
 import argparse
 import numpy as np
 from pathlib import Path
@@ -92,6 +93,7 @@ def prepare_sharded_data(
         dataset_tokens = []
         token_count = 0
         sample_count = 0
+        start_time = time.time()
 
         try:
             for text in loader.load_dataset_samples(dataset_name, max_samples=target_samples):
@@ -107,11 +109,18 @@ def prepare_sharded_data(
                 if token_count >= target_tokens:
                     break
 
-                # Progress update every 1000 samples
-                if sample_count % 1000 == 0:
-                    print(f"    {sample_count:,} samples, {token_count:,} tokens...", end="\r")
+                # Progress update every 500 samples with speed
+                if sample_count % 500 == 0:
+                    elapsed = time.time() - start_time
+                    tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
+                    progress_pct = (token_count / target_tokens) * 100
+                    eta_sec = (target_tokens - token_count) / tokens_per_sec if tokens_per_sec > 0 else 0
+                    eta_min = eta_sec / 60
+                    print(f"    {progress_pct:5.1f}% | {token_count:,} tokens | {tokens_per_sec:,.0f} tok/s | ETA: {eta_min:.1f}min", end="\r")
 
-            print(f"  Collected: {token_count:,} tokens from {sample_count:,} samples")
+            elapsed = time.time() - start_time
+            tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
+            print(f"  Collected: {token_count:,} tokens from {sample_count:,} samples ({tokens_per_sec:,.0f} tok/s, {elapsed:.1f}s)")
             all_tokens.extend(dataset_tokens[:target_tokens])
             total_collected += min(token_count, target_tokens)
 

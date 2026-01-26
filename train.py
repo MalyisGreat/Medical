@@ -331,16 +331,18 @@ def train(config: TrainConfig):
         shuffle = False  # Streaming handles its own randomization
 
         # Create train loader (streaming is infinite)
+        # More workers for 8xH100 to keep up with GPU throughput
+        num_workers = 8 if ddp else 2
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            num_workers=4 if ddp else 2,
+            num_workers=num_workers,
             pin_memory="cuda" in device,
-            prefetch_factor=2,
+            prefetch_factor=4,  # Prefetch more for 8xH100
         )
         eval_loader = None
 
-        print_main(f"  Streaming dataloader ready", rank)
+        print_main(f"  Streaming dataloader ready (workers={num_workers})", rank)
 
     elif config.data_dir:
         # Use pre-prepared sharded data (recommended for large-scale training)

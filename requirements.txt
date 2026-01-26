@@ -1,0 +1,21 @@
+# Medical LLM Pretraining Requirements
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+
+# Data loading
+datasets>=2.16.0
+tiktoken>=0.5.0
+tqdm>=4.66.0
+
+# Hugging Face
+transformers>=4.36.0
+huggingface-hub>=0.20.0
+
+# Utilities
+einops>=0.7.0
+
+# Optional: For faster training (if available)
+# flash-attn>=2.3.0  # Requires CUDA 11.6+
+# triton>=2.1.0      # For torch.compile optimizations

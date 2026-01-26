@@ -1,0 +1,38 @@
+# Data and cache
+data_cache/
+*.pt
+*.bin
+
+# Output
+output/
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+runs/
+
+# Environment
+.env
+.venv/
+venv/

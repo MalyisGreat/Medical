@@ -36,6 +36,7 @@ from typing import Optional, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
@@ -48,6 +49,127 @@ from model import (
 )
 from data_loader import MedicalPretrainDataLoader
 from streaming_loader import StreamingMedicalDataset
+
+
+# =============================================================================
+# Muon Optimizer (from modded-nanogpt speedruns)
+# Converges 2-3x faster than AdamW for transformer pretraining
+# =============================================================================
+
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute G @ (G.T @ G)^{-1/2}.
+    This is used for orthogonalizing gradients in Muon.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps)
+
+    if G.size(0) > G.size(1):
+        X = X.T
+
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon optimizer from modded-nanogpt.
+
+    Uses orthogonalized gradients via Newton-Schulz iteration.
+    Converges significantly faster than AdamW for LLM pretraining.
+
+    Reference: https://github.com/KellerJordan/modded-nanogpt
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 ns_steps=5, adamw_params=None, adamw_lr=3e-4,
+                 adamw_betas=(0.9, 0.95), adamw_wd=0.1):
+        """
+        Args:
+            params: Parameters to optimize with Muon (typically attention/MLP weights)
+            lr: Learning rate for Muon
+            momentum: Momentum factor
+            nesterov: Use Nesterov momentum
+            ns_steps: Newton-Schulz iteration steps
+            adamw_params: Parameters to optimize with AdamW (embeddings, norms)
+            adamw_lr: Learning rate for AdamW params
+            adamw_betas: Betas for AdamW
+            adamw_wd: Weight decay for AdamW
+        """
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+        # Separate AdamW optimizer for embeddings/norms
+        self.adamw_params = list(adamw_params) if adamw_params else []
+        if self.adamw_params:
+            self.adamw = torch.optim.AdamW(
+                self.adamw_params,
+                lr=adamw_lr,
+                betas=adamw_betas,
+                weight_decay=adamw_wd,
+                fused=torch.cuda.is_available()
+            )
+        else:
+            self.adamw = None
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            ns_steps = group['ns_steps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                g = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+
+                # Apply Newton-Schulz orthogonalization for 2D weight matrices
+                if g.dim() == 2 and g.size(0) < 10000:
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                    # Scale by sqrt of dimensions (from modded-nanogpt)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+
+                p.add_(g, alpha=-lr)
+
+        # Step the AdamW optimizer for embeddings/norms
+        if self.adamw is not None:
+            self.adamw.step()
+
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        if self.adamw is not None:
+            self.adamw.zero_grad(set_to_none=set_to_none)
 
 
 @dataclass
@@ -64,11 +186,14 @@ class TrainConfig:
     eval_split: float = 0.05  # 5% for evaluation
 
     # Optimization
-    learning_rate: float = 3e-4
+    optimizer: str = "muon"  # muon (fast!) or adamw
+    learning_rate: float = 3e-4  # For AdamW; Muon uses 0.02
+    muon_lr: float = 0.02  # Muon learning rate
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    grad_accum_steps: int = 1  # Gradient accumulation steps
 
     # Schedule
     warmup_steps: int = 100
@@ -442,32 +567,68 @@ def train(config: TrainConfig):
     else:
         print_main(f"Streaming mode: infinite batches", rank)
 
-    # Setup optimizer
-    decay_params = []
-    no_decay_params = []
+    # Setup optimizer - separate params for Muon vs AdamW
+    muon_params = []  # 2D weight matrices (attention, MLP) - use Muon
+    adamw_params = []  # Embeddings, norms, biases - use AdamW
 
     for name, param in raw_model.named_parameters():
         if param.requires_grad:
-            if 'ln_' in name or 'norm' in name or 'wte' in name or 'bias' in name:
-                no_decay_params.append(param)
+            # Muon works on 2D weight matrices, AdamW on everything else
+            if param.dim() == 2 and 'wte' not in name and 'wpe' not in name:
+                muon_params.append(param)
             else:
-                decay_params.append(param)
+                adamw_params.append(param)
 
-    optimizer = torch.optim.AdamW([
-        {'params': decay_params, 'weight_decay': config.weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0},
-    ], lr=config.learning_rate, betas=(config.beta1, config.beta2))
+    # Choose optimizer
+    use_fused = torch.cuda.is_available() and 'cuda' in device
+    if config.optimizer == "muon":
+        optimizer = Muon(
+            muon_params,
+            lr=config.muon_lr,
+            momentum=0.95,
+            nesterov=True,
+            ns_steps=5,
+            adamw_params=adamw_params,
+            adamw_lr=config.learning_rate,
+            adamw_betas=(config.beta1, config.beta2),
+            adamw_wd=0.0,  # No weight decay on embeddings/norms
+        )
+        print_main(f"\nOptimizer: Muon (speedrun mode!)", rank)
+        print_main(f"  Muon LR: {config.muon_lr}", rank)
+        print_main(f"  AdamW LR: {config.learning_rate} (for embeddings/norms)", rank)
+        print_main(f"  Muon params: {sum(p.numel() for p in muon_params):,}", rank)
+        print_main(f"  AdamW params: {sum(p.numel() for p in adamw_params):,}", rank)
+    else:
+        # Standard AdamW with fused kernels
+        decay_params = []
+        no_decay_params = []
+        for name, param in raw_model.named_parameters():
+            if param.requires_grad:
+                if 'ln_' in name or 'norm' in name or 'wte' in name or 'bias' in name:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
 
-    # Load optimizer state if resuming
-    if config.resume and 'optimizer_state_dict' in checkpoint:
+        optimizer = torch.optim.AdamW([
+            {'params': decay_params, 'weight_decay': config.weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ], lr=config.learning_rate, betas=(config.beta1, config.beta2), fused=use_fused)
+
+        print_main(f"\nOptimizer: AdamW {'(fused)' if use_fused else ''}", rank)
+        print_main(f"  Learning rate: {config.learning_rate}", rank)
+        print_main(f"  Weight decay: {config.weight_decay}", rank)
+        print_main(f"  Decayed params: {sum(p.numel() for p in decay_params):,}", rank)
+        print_main(f"  Non-decayed params: {sum(p.numel() for p in no_decay_params):,}", rank)
+
+    # Load optimizer state if resuming (only for AdamW - Muon doesn't save state well)
+    if config.resume and 'optimizer_state_dict' in checkpoint and config.optimizer == "adamw":
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print_main("  Loaded optimizer state", rank)
 
-    print_main(f"\nOptimizer: AdamW", rank)
-    print_main(f"  Learning rate: {config.learning_rate}", rank)
-    print_main(f"  Weight decay: {config.weight_decay}", rank)
-    print_main(f"  Decayed params: {sum(p.numel() for p in decay_params):,}", rank)
-    print_main(f"  Non-decayed params: {sum(p.numel() for p in no_decay_params):,}", rank)
+    # Gradient accumulation info
+    if config.grad_accum_steps > 1:
+        print_main(f"  Gradient accumulation: {config.grad_accum_steps} steps", rank)
+        print_main(f"  Effective batch size: {config.batch_size * config.grad_accum_steps * world_size}", rank)
 
     # Training loop
     print_main("\n" + "=" * 60, rank)
@@ -488,6 +649,9 @@ def train(config: TrainConfig):
     lr_decay_steps = config.lr_decay_steps or max_steps
 
     epoch = 0
+    micro_step = 0  # For gradient accumulation
+    accum_loss = 0.0
+
     while step < max_steps:
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -499,35 +663,64 @@ def train(config: TrainConfig):
             inputs = inputs.to(device)
             targets = targets.to(device)
 
-            # Update learning rate
-            lr = get_lr(step, config.warmup_steps, lr_decay_steps, config.learning_rate)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+            # Determine if this is an accumulation step or optimizer step
+            is_accum_step = (micro_step + 1) % config.grad_accum_steps != 0
+            micro_step += 1
 
-            # Forward pass
-            optimizer.zero_grad(set_to_none=True)
-
-            if use_amp:
-                with torch.amp.autocast('cuda', dtype=autocast_dtype):
-                    logits, loss = model(inputs, targets)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+            # Forward pass with optional gradient sync control for DDP
+            if ddp and is_accum_step:
+                # Don't sync gradients during accumulation
+                with model.no_sync():
+                    if use_amp:
+                        with torch.amp.autocast('cuda', dtype=autocast_dtype):
+                            logits, loss = model(inputs, targets)
+                        loss = loss / config.grad_accum_steps
+                        scaler.scale(loss).backward()
+                    else:
+                        logits, loss = model(inputs, targets)
+                        loss = loss / config.grad_accum_steps
+                        loss.backward()
             else:
-                logits, loss = model(inputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                optimizer.step()
+                if use_amp:
+                    with torch.amp.autocast('cuda', dtype=autocast_dtype):
+                        logits, loss = model(inputs, targets)
+                    loss = loss / config.grad_accum_steps
+                    scaler.scale(loss).backward()
+                else:
+                    logits, loss = model(inputs, targets)
+                    loss = loss / config.grad_accum_steps
+                    loss.backward()
 
-            # Accumulate stats
-            total_loss += loss.item()
-            tokens_processed += inputs.numel() * world_size  # Account for all GPUs
-            step += 1
+            accum_loss += loss.item() * config.grad_accum_steps  # Undo scaling for logging
 
-            # Logging
-            if step % config.log_interval == 0:
+            # Only step optimizer after accumulation is complete
+            if not is_accum_step:
+                # Update learning rate
+                base_lr = config.muon_lr if config.optimizer == "muon" else config.learning_rate
+                lr = get_lr(step, config.warmup_steps, lr_decay_steps, base_lr)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+
+                # Gradient clipping and optimizer step
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    optimizer.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                # Accumulate stats
+                total_loss += accum_loss
+                tokens_processed += inputs.numel() * world_size * config.grad_accum_steps
+                step += 1
+                accum_loss = 0.0
+
+            # Logging (only after optimizer step)
+            if not is_accum_step and step % config.log_interval == 0 and step > 0:
                 avg_loss = total_loss / config.log_interval
                 elapsed = time.time() - start_time
                 tokens_per_sec = tokens_processed / elapsed
@@ -540,8 +733,8 @@ def train(config: TrainConfig):
 
                 total_loss = 0.0
 
-            # Evaluation
-            if step % config.eval_interval == 0:
+            # Evaluation (only after optimizer step)
+            if not is_accum_step and step % config.eval_interval == 0 and step > 0:
                 if eval_loader is not None:
                     model.eval()
                     eval_losses = []
@@ -596,8 +789,8 @@ def train(config: TrainConfig):
 
                 model.train()
 
-            # Periodic save
-            if step % config.save_interval == 0 and is_main_process(rank):
+            # Periodic save (only after optimizer step)
+            if not is_accum_step and step % config.save_interval == 0 and step > 0 and is_main_process(rank):
                 torch.save({
                     'step': step,
                     'model_state_dict': raw_model.state_dict(),
@@ -669,7 +862,14 @@ def main():
     parser.add_argument("--max_steps", type=int, default=100,
                         help="Maximum training steps")
     parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Learning rate")
+                        help="Learning rate (for AdamW and embeddings)")
+    parser.add_argument("--optimizer", type=str, default="muon",
+                        choices=["muon", "adamw"],
+                        help="Optimizer: muon (fast, speedrun) or adamw")
+    parser.add_argument("--muon_lr", type=float, default=0.02,
+                        help="Muon learning rate (default: 0.02)")
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps (default: 1)")
     parser.add_argument("--eval_interval", type=int, default=100,
                         help="Evaluation interval (steps)")
     parser.add_argument("--save_interval", type=int, default=500,
@@ -716,7 +916,10 @@ def main():
         max_tokens=args.max_tokens,
         batch_size=args.batch_size,
         max_steps=args.max_steps,
+        optimizer=args.optimizer,
         learning_rate=args.lr,
+        muon_lr=args.muon_lr,
+        grad_accum_steps=args.grad_accum,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         device=args.device,

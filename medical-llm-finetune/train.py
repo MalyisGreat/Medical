@@ -248,6 +248,8 @@ class PeriodicBenchmarkCallback(TrainerCallback):
         if progress + 1e-6 < self.next_percent:
             return control
 
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
         model = kwargs.get("model")
         tokenizer = kwargs.get("tokenizer")
 
@@ -277,6 +279,12 @@ class PeriodicBenchmarkCallback(TrainerCallback):
             }
             with open(out_path, "a") as f:
                 f.write(json.dumps(payload) + "\n")
+            for name, res in results.items():
+                acc = res["accuracy"] * 100
+                print(
+                    f"[rank {local_rank}] periodic {name}: {acc:5.1f}% "
+                    f"({res['correct']}/{res['total']}) at {payload['progress_percent']}%"
+                )
             if was_training:
                 model.train()
             if torch.cuda.is_available():

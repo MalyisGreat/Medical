@@ -264,14 +264,20 @@ def main():
     ta_kwargs = filter_kwargs_for_signature(TrainingArguments.__init__, ta_kwargs)
     training_args = TrainingArguments(**ta_kwargs)
 
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=training_args,
         train_dataset=ds_train_tok,
         eval_dataset=ds_val_tok,
         data_collator=collator,
-        tokenizer=tokenizer,
     )
+    trainer_sig = inspect.signature(Trainer.__init__)
+    if "tokenizer" in trainer_sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
 
     # Train
     trainer.train()

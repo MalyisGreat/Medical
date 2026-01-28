@@ -124,7 +124,12 @@ def load_medmcqa(num_questions: Optional[int] = 100) -> List[Dict]:
 
 def load_pubmedqa(num_questions: Optional[int] = 100, strict_holdout: bool = True) -> List[Dict]:
     try:
-        ds = load_dataset("bigbio/pubmed_qa", "pubmed_qa_labeled_fold0_source", split="test")
+        ds = load_dataset(
+            "bigbio/pubmed_qa",
+            "pubmed_qa_labeled_fold0_source",
+            split="test",
+            trust_remote_code=True,
+        )
     except Exception:
         try:
             ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="test")

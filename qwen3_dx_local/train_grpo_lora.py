@@ -53,13 +53,15 @@ def try_apply_chat_template(tokenizer, messages, add_generation_prompt: bool):
             add_generation_prompt=add_generation_prompt,
         )
 
-def parse_choice_letter(text: str) -> Optional[str]:
-    m = re.search(r"[A-E]", text.strip().upper())
-    return m.group(0) if m else None
+def first_non_ws_char(text: str) -> str:
+    for ch in (text or ""):
+        if not ch.isspace():
+            return ch
+    return ""
 
-def parse_strict_letter(text: str) -> Optional[str]:
-    m = re.fullmatch(r"\s*([A-E])\s*", text.strip().upper())
-    return m.group(1) if m else None
+def parse_choice_letter(text: str) -> Optional[str]:
+    ch = first_non_ws_char(text).upper()
+    return ch if ch in {"A", "B", "C", "D", "E"} else None
 
 def normalize_label(text: str) -> str:
     text = text.strip().lower()
@@ -83,11 +85,13 @@ def score_one(task_type: str, completion: str, ground_truth: str, dx_label: str,
     dx_label = dx_label or ""
     triage = triage or ""
 
-    if task_type in {"dx_mcq", "dx_mcq_letter_v2"}:
-        pred = parse_strict_letter(completion)
-        gt = parse_strict_letter(ground_truth)
-        if pred is None or gt is None:
-            return -0.5
+    if task_type in {"dx_mcq", "dx_mcq_letter_v2", "dx_abstain_options_v2"}:
+        pred = parse_choice_letter(completion)
+        gt = parse_choice_letter(ground_truth)
+        if pred is None:
+            return -0.25
+        if gt is None:
+            return 0.0
         return 1.0 if pred == gt else 0.0
 
     if task_type in {
@@ -95,7 +99,6 @@ def score_one(task_type: str, completion: str, ground_truth: str, dx_label: str,
         "dx_abstain_label",
         "dx_mcq_label_v2",
         "dx_free_label_v2",
-        "dx_abstain_options_v2",
         "dx_abstain_free_v2",
     }:
         pred = normalize_label(completion)

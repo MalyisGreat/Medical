@@ -123,20 +123,14 @@ def load_medmcqa(num_questions: Optional[int] = 100) -> List[Dict]:
 
 
 def load_pubmedqa(num_questions: Optional[int] = 100, strict_holdout: bool = True) -> List[Dict]:
+    # Prefer datasets that don't rely on legacy loading scripts.
     try:
-        ds = load_dataset(
-            "bigbio/pubmed_qa",
-            "pubmed_qa_labeled_fold0_source",
-            split="test",
-            trust_remote_code=True,
-        )
+        ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="test")
     except Exception:
-        try:
-            ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="test")
-        except Exception:
-            if strict_holdout:
-                raise RuntimeError("PubMedQA test split not available; strict holdout is enabled.")
-            ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
+        if strict_holdout:
+            print("[benchmark] PubMedQA test split not available; skipping PubMedQA (strict holdout).")
+            return []
+        ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled", split="train")
 
     questions = []
     for i, item in enumerate(ds):
@@ -177,7 +171,10 @@ def evaluate_model(
             results[name] = _evaluate_mcq(model, tokenizer, device, system_prompt, qs)
         elif name == "pubmedqa":
             qs = load_pubmedqa(num_questions, strict_holdout=strict_holdout)
-            results[name] = _evaluate_yes_no(model, tokenizer, device, system_prompt, qs)
+            if not qs:
+                results[name] = {"accuracy": None, "correct": 0, "total": 0, "skipped": True}
+            else:
+                results[name] = _evaluate_yes_no(model, tokenizer, device, system_prompt, qs)
     return results
 
 
@@ -218,6 +215,9 @@ def main():
     )
 
     for name, res in results.items():
+        if res.get("skipped"):
+            print(f"{name:10s}: skipped (no holdout split)")
+            continue
         acc = res["accuracy"] * 100
         print(f"{name:10s}: {acc:5.1f}% ({res['correct']}/{res['total']})")
 

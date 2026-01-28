@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from trl import GRPOTrainer, GRPOConfig
 
 DATASET_VERSIONS = ["v2", "v1"]
@@ -57,6 +57,10 @@ def parse_choice_letter(text: str) -> Optional[str]:
     m = re.search(r"[A-E]", text.strip().upper())
     return m.group(0) if m else None
 
+def parse_strict_letter(text: str) -> Optional[str]:
+    m = re.fullmatch(r"\s*([A-E])\s*", text.strip().upper())
+    return m.group(1) if m else None
+
 def normalize_label(text: str) -> str:
     text = text.strip().lower()
     text = re.sub(r"[^a-z0-9\\s]", " ", text)
@@ -80,13 +84,11 @@ def score_one(task_type: str, completion: str, ground_truth: str, dx_label: str,
     triage = triage or ""
 
     if task_type in {"dx_mcq", "dx_mcq_letter_v2"}:
-        pred = parse_choice_letter(completion)
-        gt = parse_choice_letter(ground_truth)
+        pred = parse_strict_letter(completion)
+        gt = parse_strict_letter(ground_truth)
         if pred is None or gt is None:
             return -0.5
-        acc = 1.0 if pred == gt else 0.0
-        fmt = 0.1 if re.fullmatch(r"\\s*[A-E]\\s*", completion.strip().upper()) else 0.0
-        return acc + fmt
+        return 1.0 if pred == gt else 0.0
 
     if task_type in {
         "dx_label",
@@ -207,6 +209,7 @@ def main():
     ap.add_argument("--dataset_version", type=str, default="v2", choices=["auto", "v1", "v2"])
     ap.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     ap.add_argument("--profile", type=str, default="", choices=["", "h100"], help="Apply H100-friendly defaults")
+    ap.add_argument("--init_adapter", type=str, default="", help="Path to LoRA adapter to initialize GRPO from (e.g., SFT adapter)")
     ap.add_argument("--benchmark_every_steps", type=int, default=100)
     ap.add_argument("--benchmark_num_questions", type=int, default=20)
     ap.add_argument("--benchmark_list", type=str, default="medqa,medmcqa,pubmedqa")
@@ -266,15 +269,8 @@ def main():
     remove_cols = [c for c in ds.column_names if c not in keep_cols]
     ds = ds.map(to_prompt_row, remove_columns=remove_cols)
 
+    peft_config = None
     targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
-    peft_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=targets,
-    )
 
     grpo_args = GRPOConfig(
         output_dir=str(run_dir),
@@ -295,10 +291,23 @@ def main():
         seed=args.seed,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
+    base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=dtype,
     )
+
+    if args.init_adapter:
+        model = PeftModel.from_pretrained(base_model, args.init_adapter, is_trainable=True)
+    else:
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=targets,
+        )
+        model = base_model
 
     trainer = GRPOTrainer(
         model=model,

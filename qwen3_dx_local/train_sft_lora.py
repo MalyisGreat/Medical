@@ -30,7 +30,13 @@ def dataset_files(version: str) -> Dict[str, str]:
         "test": f"{prefix}_test.jsonl",
     }
 
-DEFAULT_TASKS = "dx_mcq,dx_label"
+DEFAULT_TASKS = ",".join([
+    "dx_mcq_letter_v2",
+    "dx_mcq_label_v2",
+    "dx_free_label_v2",
+    "dx_abstain_options_v2",
+    "dx_abstain_free_v2",
+])
 
 PROFILE_DEFAULTS = {
     "h100": {
@@ -148,7 +154,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B-Base")
     ap.add_argument("--data_dir", type=str, default=".", help="Folder containing qwen3_verifiable_dx_dataset_v*_*.jsonl")
-    ap.add_argument("--dataset_version", type=str, default="auto", choices=["auto", "v1", "v2"])
+    ap.add_argument("--dataset_version", type=str, default="v2", choices=["auto", "v1", "v2"])
+    ap.add_argument("--benchmark_after_sft", action="store_true", default=True,
+                    help="Run MedQA/MedMCQA/PubMedQA after SFT (default: on)")
+    ap.add_argument("--benchmark_before_sft", action="store_true", help="Run MedQA/MedMCQA/PubMedQA before SFT")
+    ap.add_argument("--benchmark_num_questions", type=int, default=20)
+    ap.add_argument("--benchmark_list", type=str, default="medqa,medmcqa,pubmedqa")
+    ap.add_argument("--benchmark_system_prompt", type=str, default="You are a medical expert.")
+    ap.add_argument("--benchmark_allow_train_fallback", action="store_true")
     ap.add_argument("--output_dir", type=str, default="runs/sft_dx")
     ap.add_argument("--max_len", type=int, default=384)
 
@@ -231,6 +244,10 @@ def main():
     print(f"[train_sft] tasks: {sorted(task_set)}")
     ds_train = ds_train.filter(lambda x: x["task_type"] in task_set)
     ds_val = ds_val.filter(lambda x: x["task_type"] in task_set)
+    if len(ds_train) == 0:
+        raise ValueError("No training examples after filtering. Check --dataset_version and --task_types.")
+    if len(ds_val) == 0:
+        raise ValueError("No validation examples after filtering. Check --dataset_version and --task_types.")
 
     if args.limit_train > 0:
         ds_train = ds_train.select(range(min(args.limit_train, len(ds_train))))
@@ -288,6 +305,47 @@ def main():
 
     trainer = Trainer(**trainer_kwargs)
 
+    def _run_benchmarks(tag: str):
+        try:
+            import sys
+            repo_root = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(repo_root / "medical-llm-finetune"))
+            import benchmark as med_bench
+        except Exception as exc:
+            print(f"[train_sft] benchmark import failed: {exc}")
+            return
+
+        benchmarks = [b.strip() for b in args.benchmark_list.split(",") if b.strip()]
+        num_q = args.benchmark_num_questions
+        strict_holdout = not args.benchmark_allow_train_fallback
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.eval()
+
+        # preload questions once per call to avoid repeated dataset downloads per benchmark
+        questions = {}
+        for name in benchmarks:
+            if name == "medqa":
+                questions[name] = med_bench.load_medqa(num_q)
+            elif name == "medmcqa":
+                questions[name] = med_bench.load_medmcqa(num_q)
+            elif name == "pubmedqa":
+                questions[name] = med_bench.load_pubmedqa(num_q, strict_holdout=strict_holdout)
+
+        results = {}
+        for name in benchmarks:
+            qs = questions.get(name, [])
+            if name in ("medqa", "medmcqa"):
+                results[name] = med_bench._evaluate_mcq(model, tokenizer, device, args.benchmark_system_prompt, qs)
+            elif name == "pubmedqa":
+                results[name] = med_bench._evaluate_yes_no(model, tokenizer, device, args.benchmark_system_prompt, qs)
+
+        out_path = run_dir / f"benchmark_{tag}.json"
+        out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"[train_sft] benchmark {tag}: {json.dumps(results)}")
+
+    if args.benchmark_before_sft:
+        _run_benchmarks("before_sft")
+
     # Train
     trainer.train()
 
@@ -309,6 +367,9 @@ def main():
     print(f"[train_sft] adapter: {adapter_dir}")
     if args.merge_and_save:
         print(f"[train_sft] merged:  {run_dir / 'merged'}")
+
+    if args.benchmark_after_sft:
+        _run_benchmarks("after_sft")
 
 if __name__ == "__main__":
     main()

@@ -104,12 +104,12 @@ def generate_completions(model, tokenizer, prompts: List[str], max_new_tokens: i
     return completions
 
 @torch.no_grad()
-def eval_mcq(model, tokenizer, ds, max_samples: int, batch_size: int, max_new_tokens: int):
+def eval_mcq(model, tokenizer, ds, task_type: str, max_samples: int, batch_size: int, max_new_tokens: int):
     device = pick_device()
     model.eval()
 
     # Filter
-    ds = ds.filter(lambda x: x["task_type"] == "dx_mcq")
+    ds = ds.filter(lambda x: x["task_type"] == task_type)
     if max_samples > 0:
         ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -143,7 +143,7 @@ def eval_mcq(model, tokenizer, ds, max_samples: int, batch_size: int, max_new_to
     dt_s = time.time() - t0
     acc = correct / max(total, 1)
     return {
-        "task": "dx_mcq",
+        "task": task_type,
         "n": total,
         "correct": correct,
         "accuracy": acc,
@@ -262,9 +262,14 @@ def main():
     ap.add_argument("--model", type=str, required=True, help="HF model id or local folder")
     ap.add_argument("--data_dir", type=str, default=".", help="Folder containing qwen3_verifiable_dx_dataset_v*_*.jsonl")
     ap.add_argument("--split", type=str, choices=["train","val","test"], default="test")
-    ap.add_argument("--task_type", type=str, default="dx_mcq",
-                    choices=["dx_mcq", "dx_label", "dx_abstain_label", "dx_triage_json", "dx_triage_json_abstain", "all"])
-    ap.add_argument("--dataset_version", type=str, default="auto", choices=["auto", "v1", "v2"])
+    ap.add_argument("--task_type", type=str, default="dx_mcq_letter_v2",
+                    choices=[
+                        "dx_mcq", "dx_label", "dx_abstain_label", "dx_triage_json", "dx_triage_json_abstain",
+                        "dx_mcq_letter_v2", "dx_mcq_label_v2", "dx_free_label_v2",
+                        "dx_abstain_options_v2", "dx_abstain_free_v2",
+                        "all",
+                    ])
+    ap.add_argument("--dataset_version", type=str, default="v2", choices=["auto", "v1", "v2"])
     ap.add_argument("--max_samples", type=int, default=2000)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--max_new_tokens", type=int, default=32)
@@ -276,20 +281,28 @@ def main():
 
     data_files = resolve_data_files(args.data_dir, args.dataset_version)
     ds = load_dataset("json", data_files=data_files, split=args.split)
+    chosen_version = "v2" if "v2" in Path(data_files["train"]).name else "v1"
 
     metrics = []
-    if args.task_type == "dx_mcq":
-        metrics.append(eval_mcq(model, tokenizer, ds, args.max_samples, args.batch_size, args.max_new_tokens))
-    elif args.task_type in {"dx_label", "dx_abstain_label"}:
+    if args.task_type in {"dx_mcq", "dx_mcq_letter_v2"}:
+        metrics.append(eval_mcq(model, tokenizer, ds, args.task_type, args.max_samples, args.batch_size, args.max_new_tokens))
+    elif args.task_type in {"dx_label", "dx_abstain_label", "dx_mcq_label_v2", "dx_free_label_v2", "dx_abstain_options_v2", "dx_abstain_free_v2"}:
         metrics.append(eval_label(model, tokenizer, ds, args.task_type, args.max_samples, args.batch_size, args.max_new_tokens))
     elif args.task_type in {"dx_triage_json", "dx_triage_json_abstain"}:
         metrics.append(eval_json(model, tokenizer, ds, args.task_type, args.max_samples, args.batch_size, args.max_new_tokens))
     else:
-        metrics.append(eval_mcq(model, tokenizer, ds, args.max_samples, args.batch_size, args.max_new_tokens))
-        metrics.append(eval_label(model, tokenizer, ds, "dx_label", args.max_samples, args.batch_size, args.max_new_tokens))
-        metrics.append(eval_label(model, tokenizer, ds, "dx_abstain_label", args.max_samples, args.batch_size, args.max_new_tokens))
-        metrics.append(eval_json(model, tokenizer, ds, "dx_triage_json", args.max_samples, args.batch_size, args.max_new_tokens))
-        metrics.append(eval_json(model, tokenizer, ds, "dx_triage_json_abstain", args.max_samples, args.batch_size, args.max_new_tokens))
+        if chosen_version == "v1":
+            metrics.append(eval_mcq(model, tokenizer, ds, "dx_mcq", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_label", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_abstain_label", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_json(model, tokenizer, ds, "dx_triage_json", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_json(model, tokenizer, ds, "dx_triage_json_abstain", args.max_samples, args.batch_size, args.max_new_tokens))
+        else:
+            metrics.append(eval_mcq(model, tokenizer, ds, "dx_mcq_letter_v2", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_mcq_label_v2", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_free_label_v2", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_abstain_options_v2", args.max_samples, args.batch_size, args.max_new_tokens))
+            metrics.append(eval_label(model, tokenizer, ds, "dx_abstain_free_v2", args.max_samples, args.batch_size, args.max_new_tokens))
 
     if len(metrics) == 1:
         print(json.dumps(metrics[0], indent=2))

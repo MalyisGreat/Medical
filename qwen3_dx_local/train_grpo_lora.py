@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from peft import LoraConfig
 from trl import GRPOTrainer, GRPOConfig
 
@@ -22,7 +22,7 @@ def dataset_files(version: str) -> Dict[str, str]:
         "test": f"{prefix}_test.jsonl",
     }
 
-DEFAULT_TASKS = "dx_mcq"
+DEFAULT_TASKS = "dx_mcq_letter_v2"
 
 PROFILE_DEFAULTS = {
     "h100": {
@@ -79,7 +79,7 @@ def score_one(task_type: str, completion: str, ground_truth: str, dx_label: str,
     dx_label = dx_label or ""
     triage = triage or ""
 
-    if task_type == "dx_mcq":
+    if task_type in {"dx_mcq", "dx_mcq_letter_v2"}:
         pred = parse_choice_letter(completion)
         gt = parse_choice_letter(ground_truth)
         if pred is None or gt is None:
@@ -88,7 +88,14 @@ def score_one(task_type: str, completion: str, ground_truth: str, dx_label: str,
         fmt = 0.1 if re.fullmatch(r"\\s*[A-E]\\s*", completion.strip().upper()) else 0.0
         return acc + fmt
 
-    if task_type in {"dx_label", "dx_abstain_label"}:
+    if task_type in {
+        "dx_label",
+        "dx_abstain_label",
+        "dx_mcq_label_v2",
+        "dx_free_label_v2",
+        "dx_abstain_options_v2",
+        "dx_abstain_free_v2",
+    }:
         pred = normalize_label(completion)
         gt = normalize_label(dx_label or ground_truth)
         if not pred:
@@ -197,9 +204,14 @@ def main():
     ap.add_argument("--lora_targets", type=str, default="q_proj,k_proj,v_proj,o_proj")
 
     ap.add_argument("--task_types", type=str, default=DEFAULT_TASKS, help="Comma-separated task types to include")
-    ap.add_argument("--dataset_version", type=str, default="auto", choices=["auto", "v1", "v2"])
+    ap.add_argument("--dataset_version", type=str, default="v2", choices=["auto", "v1", "v2"])
     ap.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     ap.add_argument("--profile", type=str, default="", choices=["", "h100"], help="Apply H100-friendly defaults")
+    ap.add_argument("--benchmark_every_steps", type=int, default=100)
+    ap.add_argument("--benchmark_num_questions", type=int, default=20)
+    ap.add_argument("--benchmark_list", type=str, default="medqa,medmcqa,pubmedqa")
+    ap.add_argument("--benchmark_system_prompt", type=str, default="You are a medical expert.")
+    ap.add_argument("--benchmark_allow_train_fallback", action="store_true")
     args = ap.parse_args()
 
     apply_profile(args)
@@ -234,6 +246,8 @@ def main():
     data_files = resolve_data_files(args.data_dir, args.dataset_version)
     ds = load_dataset("json", data_files=data_files, split="train")
     ds = ds.filter(lambda x: x["task_type"] in task_set)
+    if len(ds) == 0:
+        raise ValueError("No training examples after filtering. Check --dataset_version and --task_types.")
 
     def to_prompt_row(ex):
         msgs = ex["messages"]
@@ -294,6 +308,62 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+
+    if args.benchmark_every_steps > 0:
+        try:
+            import sys
+            repo_root = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(repo_root / "medical-llm-finetune"))
+            import benchmark as med_bench
+        except Exception as exc:
+            print(f"[train_grpo] benchmark import failed: {exc}")
+            med_bench = None
+
+        if med_bench is not None:
+            benchmarks = [b.strip() for b in args.benchmark_list.split(",") if b.strip()]
+            num_q = args.benchmark_num_questions
+            strict_holdout = not args.benchmark_allow_train_fallback
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # preload questions once
+            questions = {}
+            for name in benchmarks:
+                if name == "medqa":
+                    questions[name] = med_bench.load_medqa(num_q)
+                elif name == "medmcqa":
+                    questions[name] = med_bench.load_medmcqa(num_q)
+                elif name == "pubmedqa":
+                    questions[name] = med_bench.load_pubmedqa(num_q, strict_holdout=strict_holdout)
+
+            class BenchmarkCallback(TrainerCallback):
+                def __init__(self):
+                    self.last_step = 0
+
+                def on_step_end(self, args_cb, state, control, **kwargs):
+                    if state.global_step == 0:
+                        return control
+                    if state.global_step % args.benchmark_every_steps != 0:
+                        return control
+                    if state.global_step == self.last_step:
+                        return control
+
+                    self.last_step = state.global_step
+                    model.eval()
+                    results = {}
+                    for name in benchmarks:
+                        qs = questions.get(name, [])
+                        if name in ("medqa", "medmcqa"):
+                            results[name] = med_bench._evaluate_mcq(model, tokenizer, device, args.benchmark_system_prompt, qs)
+                        elif name == "pubmedqa":
+                            results[name] = med_bench._evaluate_yes_no(model, tokenizer, device, args.benchmark_system_prompt, qs)
+                    out_path = run_dir / "benchmark_progress.jsonl"
+                    with out_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": state.global_step, "results": results}) + "\n")
+                    print(f"[train_grpo] benchmark step {state.global_step}: {json.dumps(results)}")
+                    model.train()
+                    return control
+
+            trainer.add_callback(BenchmarkCallback())
 
     trainer.train()
 

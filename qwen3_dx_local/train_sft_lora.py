@@ -20,11 +20,15 @@ from transformers import (
 import inspect
 from peft import LoraConfig, get_peft_model
 
-DATASET_FILES = {
-    "train": "qwen3_verifiable_dx_dataset_v1_train.jsonl",
-    "val": "qwen3_verifiable_dx_dataset_v1_val.jsonl",
-    "test": "qwen3_verifiable_dx_dataset_v1_test.jsonl",
-}
+DATASET_VERSIONS = ["v2", "v1"]
+
+def dataset_files(version: str) -> Dict[str, str]:
+    prefix = f"qwen3_verifiable_dx_dataset_{version}"
+    return {
+        "train": f"{prefix}_train.jsonl",
+        "val": f"{prefix}_val.jsonl",
+        "test": f"{prefix}_test.jsonl",
+    }
 
 DEFAULT_TASKS = "dx_mcq,dx_label"
 
@@ -119,27 +123,32 @@ def resolve_dtype(args, device: str) -> Tuple[torch.dtype, bool, bool]:
         return torch.bfloat16, True, False
     return torch.float16, False, True
 
-def resolve_data_files(data_dir: str) -> Dict[str, str]:
-    def files_exist(base: Path) -> bool:
-        return all((base / name).exists() for name in DATASET_FILES.values())
+def resolve_data_files(data_dir: str, dataset_version: str) -> Dict[str, str]:
+    def files_exist(base: Path, files: Dict[str, str]) -> bool:
+        return all((base / name).exists() for name in files.values())
 
     base = Path(data_dir).expanduser().resolve()
-    if files_exist(base):
-        return {k: str(base / v) for k, v in DATASET_FILES.items()}
-
     script_dir = Path(__file__).resolve().parent
-    if files_exist(script_dir):
-        return {k: str(script_dir / v) for k, v in DATASET_FILES.items()}
+
+    versions = DATASET_VERSIONS if dataset_version == "auto" else [dataset_version]
+    for v in versions:
+        files = dataset_files(v)
+        if files_exist(base, files):
+            return {k: str(base / v) for k, v in files.items()}
+        if files_exist(script_dir, files):
+            return {k: str(script_dir / v) for k, v in files.items()}
 
     raise FileNotFoundError(
         f"Dataset files not found in '{base}' or '{script_dir}'. "
-        "Pass --data_dir pointing to the folder with qwen3_verifiable_dx_dataset_v1_*.jsonl."
+        "Expected qwen3_verifiable_dx_dataset_v2_*.jsonl or v1. "
+        "Pass --data_dir pointing to the folder with the dataset files."
     )
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B-Base")
-    ap.add_argument("--data_dir", type=str, default=".", help="Folder containing qwen3_verifiable_dx_dataset_v1_*.jsonl")
+    ap.add_argument("--data_dir", type=str, default=".", help="Folder containing qwen3_verifiable_dx_dataset_v*_*.jsonl")
+    ap.add_argument("--dataset_version", type=str, default="auto", choices=["auto", "v1", "v2"])
     ap.add_argument("--output_dir", type=str, default="runs/sft_dx")
     ap.add_argument("--max_len", type=int, default=384)
 
@@ -214,7 +223,7 @@ def main():
     model.print_trainable_parameters()
 
     # Load data
-    data_files = resolve_data_files(args.data_dir)
+    data_files = resolve_data_files(args.data_dir, args.dataset_version)
     ds_train = load_dataset("json", data_files=data_files, split="train")
     ds_val = load_dataset("json", data_files=data_files, split="val")
 

@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig
 from trl import GRPOTrainer, GRPOConfig
 
@@ -270,11 +270,15 @@ def main():
         report_to=["tensorboard"],
         remove_unused_columns=False,  # keep ground_truth for reward func :contentReference[oaicite:16]{index=16}
         seed=args.seed,
-        model_init_kwargs={"torch_dtype": dtype},
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=dtype,
     )
 
     trainer = GRPOTrainer(
-        model=args.model,
+        model=model,
         args=grpo_args,
         train_dataset=ds,
         reward_funcs=reward_dx,

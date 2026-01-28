@@ -91,6 +91,10 @@ def parse_task_types(val: str) -> Set[str]:
     items = [v.strip() for v in val.split(",") if v.strip()]
     return set(items)
 
+def filter_kwargs_for_signature(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    sig = inspect.signature(fn)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
 def apply_profile(args) -> None:
     if args.profile and args.profile in PROFILE_DEFAULTS:
         cfg = PROFILE_DEFAULTS[args.profile]
@@ -254,9 +258,10 @@ def main():
     sig = inspect.signature(TrainingArguments.__init__)
     if "evaluation_strategy" in sig.parameters:
         ta_kwargs["evaluation_strategy"] = "steps"
-    else:
+    elif "eval_strategy" in sig.parameters:
         ta_kwargs["eval_strategy"] = "steps"
 
+    ta_kwargs = filter_kwargs_for_signature(TrainingArguments.__init__, ta_kwargs)
     training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
